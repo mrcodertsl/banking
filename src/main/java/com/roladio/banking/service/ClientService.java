@@ -3,6 +3,8 @@ package com.roladio.banking.service;
 import com.roladio.banking.dto.ClientResponse;
 import com.roladio.banking.dto.TransferRequest;
 import com.roladio.banking.model.Client;
+import com.roladio.banking.repository.ClientRepository;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
@@ -11,19 +13,19 @@ import java.util.stream.Collectors;
 @Service
 public class ClientService {
 
-    private final List<Client> clients = List.of(
-            new Client(1L, "Anna", "Berlin", 5000.0),
-            new Client(2L, "Bob",  "Toronto",  1200.0),
-            new Client(3L, "Cara", "Lisbon", 8000.0),
-            new Client(4L, "Dan",  "Melbourne",   300.0)
-    );
+    private final ClientRepository clientRepository;
+
+    public ClientService(ClientRepository clientRepository) {
+        this.clientRepository = clientRepository;
+    }
 
     public List<ClientResponse> getAllClients() {
-        return clients.stream()
+        return clientRepository.findAll().stream()
                 .map(c -> new ClientResponse(c.getId(), c.getName(), c.getBalance()))
                 .collect(Collectors.toList());
     }
 
+    @Transactional
     public void transfer(TransferRequest request) {
         if (request.amount() <= 0) {
             throw new IllegalArgumentException("Amount must be positive");
@@ -41,12 +43,13 @@ public class ClientService {
 
         from.setBalance(from.getBalance() - request.amount());
         to.setBalance(to.getBalance() + request.amount());
+
+        clientRepository.save(from);
+        clientRepository.save(to);
     }
 
     private Client findClientById(Long id) {
-        return clients.stream()
-                .filter(c -> c.getId().equals(id))
-                .findFirst()
+        return clientRepository.findById(id)
                 .orElseThrow(() -> new IllegalArgumentException("Client not found: " + id));
     }
 }
