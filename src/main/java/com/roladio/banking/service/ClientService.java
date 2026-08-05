@@ -1,6 +1,7 @@
 package com.roladio.banking.service;
 
-import com.roladio.banking.dto.ClientDto;
+import com.roladio.banking.dto.ClientResponse;
+import com.roladio.banking.dto.TransferRequest;
 import com.roladio.banking.model.Client;
 import org.springframework.stereotype.Service;
 
@@ -17,9 +18,35 @@ public class ClientService {
             new Client(4L, "Dan",  "Melbourne",   300.0)
     );
 
-    public List<ClientDto> getAllClients() {
+    public List<ClientResponse> getAllClients() {
         return clients.stream()
-                .map(c -> new ClientDto(c.getId(), c.getName(), c.getBalance()))
+                .map(c -> new ClientResponse(c.getId(), c.getName(), c.getBalance()))
                 .collect(Collectors.toList());
+    }
+
+    public void transfer(TransferRequest request) {
+        if (request.amount() <= 0) {
+            throw new IllegalArgumentException("Amount must be positive");
+        }
+        if (request.fromId().equals(request.toId())) {
+            throw new IllegalArgumentException("Cannot transfer to the same account");
+        }
+
+        Client from = findClientById(request.fromId());
+        Client to = findClientById(request.toId());
+
+        if (from.getBalance() < request.amount()) {
+            throw new IllegalStateException("Insufficient funds");
+        }
+
+        from.setBalance(from.getBalance() - request.amount());
+        to.setBalance(to.getBalance() + request.amount());
+    }
+
+    private Client findClientById(Long id) {
+        return clients.stream()
+                .filter(c -> c.getId().equals(id))
+                .findFirst()
+                .orElseThrow(() -> new IllegalArgumentException("Client not found: " + id));
     }
 }

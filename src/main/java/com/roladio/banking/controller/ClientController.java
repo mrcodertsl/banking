@@ -1,10 +1,9 @@
 package com.roladio.banking.controller;
 
-import com.roladio.banking.dto.ClientDto;
+import com.roladio.banking.dto.ClientResponse;
+import com.roladio.banking.dto.TransferRequest;
 import com.roladio.banking.service.ClientService;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
 
@@ -19,7 +18,12 @@ public class ClientController {
     }
 
     @GetMapping
-    public List<ClientDto> getAllClients() {
+    public List<ClientResponse> getAllClients() {
         return clientService.getAllClients();
+    }
+
+    @PostMapping("/transfer")
+    public void transfer(@RequestBody TransferRequest request) {
+        clientService.transfer(request);
     }
 }

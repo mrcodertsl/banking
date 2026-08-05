@@ -1,12 +1,18 @@
 package com.roladio.banking.model;
 
-import lombok.AllArgsConstructor;
-import lombok.Getter;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import lombok.*;
 
 @Getter
+@Setter
 @AllArgsConstructor
+@NoArgsConstructor(access = AccessLevel.PROTECTED)
+@Entity
 public class Client {
-    private long id;
+
+    @Id
+    private Long id;
     private String name;
     private String city;
     private double balance;
