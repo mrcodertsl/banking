@@ -16,9 +16,11 @@ public class DataSeeder implements CommandLineRunner {
 
     @Override
     public void run(String... args) throws Exception {
-        clientRepository.save(new Client(1L, "Anna", "Berlin", 5000.0));
-        clientRepository.save(new Client(2L, "Bob",  "Toronto",   1200.0));
-        clientRepository.save(new Client(3L, "Cara", "Lisbon",    8000.0));
-        clientRepository.save(new Client(4L, "Dan",  "Melbourne",  300.0));
+        if (clientRepository.count() == 0) {
+            clientRepository.save(new Client(1L, "Anna", "Berlin", 5000.0));
+            clientRepository.save(new Client(2L, "Bob",  "Toronto",   1200.0));
+            clientRepository.save(new Client(3L, "Cara", "Lisbon",    8000.0));
+            clientRepository.save(new Client(4L, "Dan",  "Melbourne",  300.0));
+        }
     }
 }
