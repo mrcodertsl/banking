@@ -7,6 +7,7 @@ A small Spring Boot REST API for managing bank clients and transferring money be
 - Java 21
 - Spring Boot 4.1.0 (Web MVC, Data JPA)
 - PostgreSQL
+- Flyway
 - Lombok
 - Maven
 
@@ -28,9 +29,17 @@ spring.datasource.password=
 
 Update the username/password to match your local PostgreSQL setup.
 
-Schema management uses [Flyway](https://flywaydb.org/) (`spring.jpa.hibernate.ddl-auto=validate` — Hibernate only validates the schema, it does not create or update it).
+Schema management uses [Flyway](https://flywaydb.org/) (`spring.jpa.hibernate.ddl-auto=validate` — Hibernate only validates the schema, it does not create or update it). Migration scripts live under `src/main/resources/db/migration`:
 
-> **Known issue:** no Flyway migration scripts exist yet under `src/main/resources/db/migration`, so the app currently has no schema to validate against and will fail to start until migrations are added. The previous `DataSeeder` (which populated sample clients on startup) has also been removed and not yet replaced.
+| Version | Change |
+|---|---|
+| V1 | Add `phone_number` column to `client` |
+| V2 | Rename `client.name` to `client.first_name` |
+| V3 | Add `last_name` column to `client` |
+
+`spring.flyway.baseline-on-migrate=true` with `spring.flyway.baseline-version=0` means Flyway treats an existing `client` table as version 0 and applies V1+ on top of it.
+
+> **Known issue:** there is no migration that creates the `client` table itself, so a brand-new empty database has nothing for V1–V3 to alter against. You need to create the base `client` table (columns: `id`, `name`, `balance`) yourself before starting the app, or point at a database where it already exists. There is currently no data seeder, so the table will be empty either way.
 
 ## Running the app
 
@@ -56,7 +65,7 @@ Returns all clients.
 
 ```json
 [
-  { "id": 1, "name": "Anna", "balance": 5000.0 }
+  { "id": 1, "firstName": "Anna", "lastName": "Smith", "balance": 5000.0 }
 ]
 ```
 
@@ -67,10 +76,28 @@ Returns a single client by id.
 **Response**
 
 ```json
-{ "id": 1, "name": "Anna", "balance": 5000.0 }
+{ "id": 1, "firstName": "Anna", "lastName": "Smith", "balance": 5000.0 }
 ```
 
-> **Known issue:** the route is currently declared as `@GetMapping("/{id}}")` (note the extra `}`) in `ClientController`, so it will not match `/clients/{id}` as intended until fixed.
+### `PATCH /clients/{id}/phoneNumber`
+
+Updates a client's phone number.
+
+**Request body**
+
+```json
+{ "phoneNumber": "+10000000000" }
+```
+
+### `PATCH /clients/{id}/lastName`
+
+Updates a client's last name.
+
+**Request body**
+
+```json
+{ "lastName": "Smith" }
+```
 
 ### `POST /clients/transfer`
 
@@ -102,4 +129,6 @@ src/main/java/com/roladio/banking
 ├── model/                       # JPA entities
 ├── repository/                  # Spring Data repositories
 └── service/                     # business logic
+
+src/main/resources/db/migration  # Flyway migration scripts
 ```
