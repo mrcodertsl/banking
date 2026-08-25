@@ -5,7 +5,6 @@ import com.roladio.banking.dto.LastNameRequest;
 import com.roladio.banking.dto.PhoneNumberRequest;
 import com.roladio.banking.dto.TransferRequest;
 import com.roladio.banking.service.ClientService;
-import jakarta.websocket.server.PathParam;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
