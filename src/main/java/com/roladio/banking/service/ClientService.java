@@ -1,11 +1,13 @@
 package com.roladio.banking.service;
 
 import com.roladio.banking.dto.ClientResponse;
+import com.roladio.banking.dto.LastNameRequest;
+import com.roladio.banking.dto.PhoneNumberRequest;
 import com.roladio.banking.dto.TransferRequest;
 import com.roladio.banking.model.Client;
 import com.roladio.banking.repository.ClientRepository;
-import org.springframework.transaction.annotation.Transactional;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
 import java.util.stream.Collectors;
@@ -21,8 +23,25 @@ public class ClientService {
 
     public List<ClientResponse> getAllClients() {
         return clientRepository.findAll().stream()
-                .map(c -> new ClientResponse(c.getId(), c.getName(), c.getBalance()))
+                .map(c -> new ClientResponse(c.getId(), c.getFirstName(), c.getLastName(), c.getBalance()))
                 .collect(Collectors.toList());
+    }
+
+    public ClientResponse getClientById(Long id) {
+        Client client = findClientById(id);
+        return new ClientResponse(client.getId(), client.getFirstName(), client.getLastName(), client.getBalance());
+    }
+
+    public void updatePhoneNumber(Long id, PhoneNumberRequest request) {
+        Client client = findClientById(id);
+        client.setPhoneNumber(request.phoneNumber());
+        clientRepository.save(client);
+    }
+
+    public void updateLastName(Long id, LastNameRequest request) {
+        Client client = findClientById(id);
+        client.setLastName(request.lastName());
+        clientRepository.save(client);
     }
 
     @Transactional
@@ -52,4 +71,5 @@ public class ClientService {
         return clientRepository.findById(id)
                 .orElseThrow(() -> new IllegalArgumentException("Client not found: " + id));
     }
+
 }

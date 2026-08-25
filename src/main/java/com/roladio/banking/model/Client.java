@@ -13,7 +13,8 @@ public class Client {
 
     @Id
     private Long id;
-    private String name;
-    private String city;
+    private String firstName;
+    private String lastName;
     private double balance;
+    private String phoneNumber;
 }

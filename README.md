@@ -26,9 +26,11 @@ spring.datasource.username=tsl
 spring.datasource.password=
 ```
 
-Update the username/password to match your local PostgreSQL setup. The schema is managed automatically via `spring.jpa.hibernate.ddl-auto=update`.
+Update the username/password to match your local PostgreSQL setup.
 
-On startup, `DataSeeder` populates the database with four sample clients if the `client` table is empty.
+Schema management uses [Flyway](https://flywaydb.org/) (`spring.jpa.hibernate.ddl-auto=validate` — Hibernate only validates the schema, it does not create or update it).
+
+> **Known issue:** no Flyway migration scripts exist yet under `src/main/resources/db/migration`, so the app currently has no schema to validate against and will fail to start until migrations are added. The previous `DataSeeder` (which populated sample clients on startup) has also been removed and not yet replaced.
 
 ## Running the app
 
@@ -58,6 +60,18 @@ Returns all clients.
 ]
 ```
 
+### `GET /clients/{id}`
+
+Returns a single client by id.
+
+**Response**
+
+```json
+{ "id": 1, "name": "Anna", "balance": 5000.0 }
+```
+
+> **Known issue:** the route is currently declared as `@GetMapping("/{id}}")` (note the extra `}`) in `ClientController`, so it will not match `/clients/{id}` as intended until fixed.
+
 ### `POST /clients/transfer`
 
 Transfers an amount from one client's balance to another.
@@ -82,7 +96,6 @@ Transfers an amount from one client's balance to another.
 ```
 src/main/java/com/roladio/banking
 ├── BankingApplication.java     # entry point
-├── DataSeeder.java              # seeds sample clients on startup
 ├── controller/                  # REST controllers
 ├── dto/                         # request/response records
 ├── exceptions/                  # global exception handling

@@ -21,29 +21,29 @@ public class ClientServiceTest {
     @Test
     void getAllClients_returnsAllClients() {
         when(repository.findAll()).thenReturn(List.of(
-                new Client(1L, "Anna", "Berlin", 5000.0),
-                new Client(2L, "Bob", "Toronto", 1200.0)
+                new Client(1L, "Anna", "Groban", 5000.0, "+12345678901"),
+                new Client(2L, "Bob", "Jackson", 1200.0, "+12345678902")
         ));
 
         List<ClientResponse> result = service.getAllClients();
 
         assertThat(result).hasSize(2);
-        assertThat(result.get(0).name()).isEqualTo("Anna");
+        assertThat(result.get(0).firstName()).isEqualTo("Anna");
         assertThat(result.get(1).balance()).isEqualTo(1200.0);
     }
 
     @Test
     void getAllClients_mapsFieldsCorrectly() {
         when(repository.findAll()).thenReturn(List.of(
-                new Client(1L, "Anna", "Berlin", 5000.0),
-                new Client(2L, "Bob", "Toronto", 1200.0)
+                new Client(1L, "Anna", "Groban", 5000.0, "+12345678901"),
+                new Client(2L, "Bob", "Jackson", 1200.0, "+12345678902")
         ));
 
         List<ClientResponse> result = service.getAllClients();
 
         ClientResponse firstClient = result.getFirst();
         assertThat(firstClient.id()).isEqualTo(1L);
-        assertThat(firstClient.name()).isEqualTo("Anna");
+        assertThat(firstClient.firstName()).isEqualTo("Anna");
         assertThat(firstClient.balance()).isEqualTo(5000.0);
     }
 
@@ -70,8 +70,10 @@ public class ClientServiceTest {
 
     @Test
     void transfer_insufficientFunds() {
-        when(repository.findById(1L)).thenReturn(Optional.of(new Client(1L, "Anna", "X", 100.0)));
-        when(repository.findById(2L)).thenReturn(Optional.of(new Client(2L, "Bob", "Y", 500.0)));
+        when(repository.findById(1L))
+                .thenReturn(Optional.of(new Client(1L, "Anna", "Groban", 5000.0, "+12345678901")));
+        when(repository.findById(2L))
+                .thenReturn(Optional.of(new Client(2L, "Bob", "Jackson", 1200.0, "+12345678902")));
 
         assertThatThrownBy(() -> service.transfer(new TransferRequest(1L, 2L, 9000.0)))
                 .isInstanceOf(IllegalStateException.class)
@@ -80,15 +82,15 @@ public class ClientServiceTest {
 
     @Test
     void transfer() {
-        Client from = new Client(2L, "Bob", "Y", 500.0);
-        Client to   = new Client(1L, "Anna", "X", 100.0);
+        Client from = new Client(1L, "Anna", "Groban", 5000.0, "+12345678901");
+        Client to   = new Client(2L, "Bob", "Jackson", 1200.0, "+12345678902");
         when(repository.findById(2L)).thenReturn(Optional.of(from));
         when(repository.findById(1L)).thenReturn(Optional.of(to));
 
         service.transfer(new TransferRequest(2L, 1L, 50.0));
 
-        assertThat(from.getBalance()).isEqualTo(450.0);
-        assertThat(to.getBalance()).isEqualTo(150.0);
+        assertThat(from.getBalance()).isEqualTo(4950.0);
+        assertThat(to.getBalance()).isEqualTo(1250.0);
 
         verify(repository).save(from);
         verify(repository).save(to);
