@@ -99,6 +99,16 @@ Updates a client's last name.
 { "lastName": "Smith" }
 ```
 
+### `PUT /clients/{id}/update`
+
+Replaces a client's first name, last name, balance, and phone number.
+
+**Request body**
+
+```json
+{ "firstName": "Anna", "lastName": "Smith", "balance": 5000.0, "phoneNumber": "+10000000000" }
+```
+
 ### `POST /clients/transfer`
 
 Transfers an amount from one client's balance to another.

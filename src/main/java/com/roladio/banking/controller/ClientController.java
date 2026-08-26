@@ -1,9 +1,6 @@
 package com.roladio.banking.controller;
 
-import com.roladio.banking.dto.ClientResponse;
-import com.roladio.banking.dto.LastNameRequest;
-import com.roladio.banking.dto.PhoneNumberRequest;
-import com.roladio.banking.dto.TransferRequest;
+import com.roladio.banking.dto.*;
 import com.roladio.banking.service.ClientService;
 import org.springframework.web.bind.annotation.*;
 
@@ -44,5 +41,11 @@ public class ClientController {
     public void updateLastName(@PathVariable Long id,
                                @RequestBody LastNameRequest request) {
         clientService.updateLastName(id, request);
+    }
+
+    @PutMapping("/{id}/update")
+    public void updateClient(@PathVariable Long id,
+                             @RequestBody ClientRequest request) {
+        clientService.updateClient(id, request);
     }
 }

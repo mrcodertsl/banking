@@ -1,9 +1,6 @@
 package com.roladio.banking.service;
 
-import com.roladio.banking.dto.ClientResponse;
-import com.roladio.banking.dto.LastNameRequest;
-import com.roladio.banking.dto.PhoneNumberRequest;
-import com.roladio.banking.dto.TransferRequest;
+import com.roladio.banking.dto.*;
 import com.roladio.banking.model.Client;
 import com.roladio.banking.repository.ClientRepository;
 import org.springframework.stereotype.Service;
@@ -32,16 +29,27 @@ public class ClientService {
         return new ClientResponse(client.getId(), client.getFirstName(), client.getLastName(), client.getBalance());
     }
 
+    @Transactional
     public void updatePhoneNumber(Long id, PhoneNumberRequest request) {
         Client client = findClientById(id);
         client.setPhoneNumber(request.phoneNumber());
         clientRepository.save(client);
     }
 
+    @Transactional
     public void updateLastName(Long id, LastNameRequest request) {
         Client client = findClientById(id);
         client.setLastName(request.lastName());
         clientRepository.save(client);
+    }
+
+    @Transactional
+    public void updateClient(Long id, ClientRequest request) {
+        Client client = findClientById(id);
+        client.setFirstName(request.firstName());
+        client.setLastName(request.lastName());
+        client.setBalance(request.balance());
+        client.setPhoneNumber(request.phoneNumber());
     }
 
     @Transactional
