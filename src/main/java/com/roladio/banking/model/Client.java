@@ -4,6 +4,8 @@ import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
 import lombok.*;
 
+import java.math.BigDecimal;
+
 @Getter
 @Setter
 @AllArgsConstructor
@@ -15,6 +17,6 @@ public class Client {
     private Long id;
     private String firstName;
     private String lastName;
-    private double balance;
+    private BigDecimal balance;
     private String phoneNumber;
 }

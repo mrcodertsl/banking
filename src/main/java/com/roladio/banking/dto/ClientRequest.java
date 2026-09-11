@@ -1,3 +1,5 @@
 package com.roladio.banking.dto;
 
-public record ClientRequest(String firstName, String lastName, double balance, String phoneNumber) {}
+import java.math.BigDecimal;
+
+public record ClientRequest(String firstName, String lastName, BigDecimal balance, String phoneNumber) {}

@@ -1,1 +1,0 @@
-ALTER TABLE client ADD COLUMN last_name VARCHAR(255);

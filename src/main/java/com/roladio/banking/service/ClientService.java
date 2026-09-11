@@ -6,6 +6,7 @@ import com.roladio.banking.repository.ClientRepository;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.math.BigDecimal;
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -54,7 +55,7 @@ public class ClientService {
 
     @Transactional
     public void transfer(TransferRequest request) {
-        if (request.amount() <= 0) {
+        if (request.amount().compareTo(BigDecimal.ZERO) <= 0) {
             throw new IllegalArgumentException("Amount must be positive");
         }
         if (request.fromId().equals(request.toId())) {
@@ -64,12 +65,12 @@ public class ClientService {
         Client from = findClientById(request.fromId());
         Client to = findClientById(request.toId());
 
-        if (from.getBalance() < request.amount()) {
+        if (from.getBalance().compareTo(request.amount()) < 0) {
             throw new IllegalStateException("Insufficient funds");
         }
 
-        from.setBalance(from.getBalance() - request.amount());
-        to.setBalance(to.getBalance() + request.amount());
+        from.setBalance(from.getBalance().subtract(request.amount()));
+        to.setBalance(to.getBalance().add(request.amount()));
 
         clientRepository.save(from);
         clientRepository.save(to);

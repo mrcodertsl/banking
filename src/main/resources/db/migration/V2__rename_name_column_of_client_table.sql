@@ -1,1 +1,0 @@
-ALTER TABLE client RENAME COLUMN name TO first_name;
