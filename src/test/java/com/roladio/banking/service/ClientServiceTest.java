@@ -150,7 +150,16 @@ public class ClientServiceTest {
 
         assertThat(client.getFirstName()).isEqualTo("FN");
         assertThat(client.getLastName()).isEqualTo("LN");
-        assertThat(client.getBalance()).isEqualByComparingTo("1000");
         assertThat(client.getPhoneNumber()).isEqualTo("+123");
+    }
+
+    @Test
+    void withdraw_whenInsufficientFunds_throwsAndLeavesBalanceUnchanged() {
+        Client client = new Client(1L, "Anna", "Groban", BigDecimal.valueOf(100), "+12345678901");
+
+        assertThatThrownBy(() -> client.withdraw(BigDecimal.valueOf(200)))
+                .isInstanceOf(InsufficientFundsException.class);
+
+        assertThat(client.getBalance()).isEqualByComparingTo("100");
     }
 }

@@ -2,7 +2,6 @@ package com.roladio.banking.service;
 
 import com.roladio.banking.dto.*;
 import com.roladio.banking.exceptions.ClientNotFoundException;
-import com.roladio.banking.exceptions.InsufficientFundsException;
 import com.roladio.banking.model.Client;
 import com.roladio.banking.repository.ClientRepository;
 import org.springframework.stereotype.Service;
@@ -48,15 +47,11 @@ public class ClientService {
         Client client = findClientById(id);
         client.setFirstName(request.firstName());
         client.setLastName(request.lastName());
-        client.setBalance(request.balance());
         client.setPhoneNumber(request.phoneNumber());
     }
 
     @Transactional
     public void transfer(TransferRequest request) {
-        if (request.amount().compareTo(BigDecimal.ZERO) <= 0) {
-            throw new IllegalArgumentException("Amount must be positive");
-        }
         if (request.fromId().equals(request.toId())) {
             throw new IllegalArgumentException("Cannot transfer to the same account");
         }
@@ -64,12 +59,8 @@ public class ClientService {
         Client from = findClientById(request.fromId());
         Client to = findClientById(request.toId());
 
-        if (from.getBalance().compareTo(request.amount()) < 0) {
-            throw new InsufficientFundsException();
-        }
-
-        from.setBalance(from.getBalance().subtract(request.amount()));
-        to.setBalance(to.getBalance().add(request.amount()));
+        from.withdraw(request.amount());
+        to.deposit(request.amount());
     }
 
     @Transactional

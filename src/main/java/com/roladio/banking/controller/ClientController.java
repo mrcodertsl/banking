@@ -3,6 +3,7 @@ package com.roladio.banking.controller;
 import com.roladio.banking.dto.*;
 import com.roladio.banking.service.ClientService;
 import jakarta.validation.Valid;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
@@ -31,6 +32,7 @@ public class ClientController {
     }
 
     @PostMapping("/transfer")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
     public void transfer(@Valid @RequestBody TransferRequest request) {
         clientService.transfer(request);
     }
@@ -48,18 +50,21 @@ public class ClientController {
     }
 
     @PatchMapping("/{id}/phoneNumber")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
     public void updatePhoneNumber(@PathVariable Long id,
                                   @Valid @RequestBody PhoneNumberRequest request) {
         clientService.updatePhoneNumber(id, request);
     }
 
     @PatchMapping("/{id}/lastName")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
     public void updateLastName(@PathVariable Long id,
                                @RequestBody LastNameRequest request) {
         clientService.updateLastName(id, request);
     }
 
     @PutMapping("/{id}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
     public void updateClient(@PathVariable Long id,
                              @Valid @RequestBody ClientRequest request) {
         clientService.updateClient(id, request);
