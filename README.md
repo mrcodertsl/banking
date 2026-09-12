@@ -26,7 +26,8 @@ A small Spring Boot REST API for managing bank clients and transferring money be
 | Schema migrations | Flyway (`spring-boot-starter-flyway` + `flyway-database-postgresql`) |
 | Boilerplate reduction | Lombok |
 | Build tool | Maven, via the included `./mvnw` / `mvnw.cmd` wrapper (Maven 3.9.16, wrapper 3.3.4 — see `.mvn/wrapper/maven-wrapper.properties`) |
-| Test framework | JUnit 5, Mockito 5.14.2, AssertJ, `spring-boot-starter-webmvc-test` |
+| Test framework | JUnit 5, Mockito 5.14.2, AssertJ (`spring-boot-starter-webmvc-test`) |
+| Integration testing | Testcontainers 2.0.5 (`spring-boot-testcontainers`, `testcontainers-postgresql`, `testcontainers-junit-jupiter`) — spins up a real PostgreSQL in Docker for the context test |
 
 ## Project Structure
 
@@ -55,8 +56,8 @@ src/main/resources/
 └── db/migration/                 # Flyway migration scripts (see below)
 
 src/test/java/com/roladio/banking
-├── BankingApplicationTests.java          # Spring context smoke test
-└── service/ClientServiceTest.java        # unit tests for ClientService
+├── BankingApplicationTests.java          # context test, backed by a Testcontainers PostgreSQL
+└── service/ClientServiceTest.java        # unit tests for ClientService (Mockito, no DB)
 ```
 
 All DTOs are Java `record`s (immutable, no validation annotations — see [Known Issues](#known-issues--limitations)). All request/response bodies are plain JSON, there is no API versioning or content negotiation beyond the Spring Boot defaults.
@@ -143,7 +144,7 @@ spring.jpa.properties.hibernate.format_sql=true
 | `spring.jpa.hibernate.ddl-auto=validate` | Hibernate validates the entity ↔ table mapping at startup but never creates/alters schema. All schema changes must go through Flyway migrations. |
 | `spring.jpa.show-sql` / `hibernate.format_sql` | Logs every SQL statement Hibernate executes, formatted, to stdout. Useful for debugging, noisy in production. |
 
-There is no `application-test.properties` / test profile, and no per-environment config (dev/staging/prod) — the same file is used everywhere, including by `BankingApplicationTests` (see [Testing](#testing)).
+There is no `application-test.properties` / test profile and no per-environment config (dev/staging/prod), so this single file applies everywhere — **except** for the datasource during tests: `BankingApplicationTests` uses Testcontainers' `@ServiceConnection`, which overrides `spring.datasource.*` at runtime to point at a throwaway PostgreSQL container instead of `localhost:5432/banking` (see [Testing](#testing)). Everything else here — `ddl-auto=validate`, SQL logging, Flyway defaults — still applies to the test context.
 
 ## Running the App
 
@@ -152,6 +153,7 @@ There is no `application-test.properties` / test profile, and no per-environment
 - JDK 21
 - A running PostgreSQL server, reachable at `localhost:5432`, with a `banking` database and a user matching `application.properties` (default: user `tsl`, no password)
 - No global Maven install required — use the bundled wrapper
+- Docker is **not** needed to run the app, only to run the tests (see [Testing](#testing))
 
 **Steps**
 
@@ -302,16 +304,34 @@ Any other unhandled exception (e.g. a database connectivity failure, a malformed
 ./mvnw test
 ```
 
-⚠️ `BankingApplicationTests` is a plain `@SpringBootTest` with no embedded/in-memory database and no test profile — it boots the **full** application context against the datasource in `application.properties`. That means `./mvnw test` requires a real, reachable PostgreSQL instance with a migrated `banking` database, exactly like running the app itself. There is no H2/Testcontainers setup, so tests are not isolated from your local Postgres.
+**Requirements:** a running Docker daemon. You do *not* need a local PostgreSQL — `BankingApplicationTests` starts its own throwaway `postgres:16-alpine` container via Testcontainers, so `./mvnw test` is self-contained and safe to run against a machine with no `banking` database (and it never touches your local data).
+
+Current state: **13 tests, all passing** (1 context test + 12 unit tests).
 
 | Test class | Type | Coverage |
 |---|---|---|
-| `BankingApplicationTests` | Spring context smoke test | `contextLoads()` — verifies the application context starts. Requires a live DB connection. |
+| `BankingApplicationTests` | Integration test (`@SpringBootTest` + `@Testcontainers`) | `contextLoads()` — boots the full application context against a disposable PostgreSQL container. Because startup runs Flyway and then `ddl-auto=validate`, this single test transitively proves that **V1→V3 apply cleanly to an empty database** and that the resulting schema **matches the `Client` entity**. |
 | `service.ClientServiceTest` | Unit test (Mockito-mocked `ClientRepository`, no DB) | `getAllClients` (mapping, size); `getClientById`; `updatePhoneNumber`; `updateLastName`; `updateClient`; `createClient` (returns the saved client's id and mapped fields); `transfer` — happy path plus negative amount, zero amount, same-account, and insufficient-funds edge cases. Balance assertions use AssertJ's `isEqualByComparingTo` (scale-independent `BigDecimal` comparison) rather than `isEqualTo`. |
 
-⚠️ `createClient`'s test only covers the mapping of a repository-returned `Client` to a `ClientResponse` — it doesn't assert *what* gets passed to `repository.save(...)` (e.g. that `id` is `null` going in), and there's still no `@WebMvcTest`/controller-level test for the new `POST /clients` route (see below).
+**How the container is wired up** (`BankingApplicationTests`):
 
-There is currently no `ClientController` test (no `@WebMvcTest` / MockMvc coverage), even though `spring-boot-starter-webmvc-test` is on the test classpath. Controller routing, request/response (de)serialization, and the `GlobalExceptionHandler` mapping are exercised only indirectly (or not at all) by the existing tests.
+```java
+@Testcontainers
+@SpringBootTest
+class BankingApplicationTests {
+
+    @Container
+    @ServiceConnection
+    static PostgreSQLContainer postgres = new PostgreSQLContainer("postgres:16-alpine");
+```
+
+`@Container` manages the container lifecycle (started once for the class, torn down after), and `@ServiceConnection` auto-configures `spring.datasource.*` from it — no manual `@DynamicPropertySource` URL/credential wiring needed. Note `PostgreSQLContainer` is *not* parameterized: Testcontainers 2.x dropped the self-referential generic that 1.x required, and the class now lives in `org.testcontainers.postgresql` (not `org.testcontainers.containers`).
+
+**Remaining gaps**
+
+- `createClient`'s test only covers mapping a repository-returned `Client` to a `ClientResponse` — it doesn't assert *what* gets passed to `repository.save(...)` (e.g. that `id` is `null` going in).
+- There is no `ClientController` test (no `@WebMvcTest` / MockMvc coverage), even though `spring-boot-starter-webmvc-test` is on the classpath. Controller routing, JSON (de)serialization, `201`/`Location` behavior on `POST /clients`, and the `GlobalExceptionHandler` status mapping are not directly exercised.
+- `spring-boot-starter-data-jpa-test` was added to the POM but is currently unused — no `@DataJpaTest` slice test exists yet, so repository-layer behavior against a real database is untested.
 
 The Maven Surefire plugin is configured with an explicit Mockito Java agent (`-javaagent:.../mockito-core-5.14.2.jar`) and `-Xshare:off`, required for Mockito's inline mock maker to work under recent JDKs.
 
@@ -329,6 +349,7 @@ The Maven Surefire plugin is configured with an explicit Mockito Java agent (`-j
 - **`createClient`'s test doesn't verify the saved entity**: it stubs `repository.save(any(Client.class))` and only checks the returned `ClientResponse`, so a bug that dropped a field before calling `save` (e.g. forgetting to copy `phoneNumber`) wouldn't be caught. There's also no controller-level test for `POST /clients` (see [Testing](#testing)).
 - **Mutation endpoints mostly return no representation**: `PATCH`/`PUT`/`POST /transfer` all return `void` (200 OK, empty body) rather than the updated resource — only the new `POST /clients` returns the created representation (`201` + body + `Location` header).
 - **No authentication/authorization**: every endpoint is unauthenticated and unauthorized — anyone who can reach port 8080 can read all client data and move money between any two accounts.
-- **Tests require a live database**: see [Testing](#testing) — there's no embedded/in-memory DB or Testcontainers setup, so CI or a fresh clone can't run `./mvnw test` without first standing up and migrating a real Postgres instance.
+- **No repository- or controller-layer tests**: the Testcontainers setup proves the context boots and the migrations validate, but no test drives `ClientRepository` against the real database or the endpoints through MockMvc (see [Testing](#testing)).
+- **`spring.jpa.open-in-view` is enabled by default**: Spring logs a warning about this on every startup. It keeps the Hibernate session open for the whole request, which can hide lazy-loading issues and hold DB connections longer than necessary; it's worth setting explicitly to `false`.
 - **No API documentation tooling**: no OpenAPI/Swagger integration — this README is currently the only API reference.
 - **No logging/observability beyond SQL logging**: `spring.jpa.show-sql=true` logs queries, but there's no structured application logging, metrics, or health-check endpoint (no Spring Boot Actuator dependency).
