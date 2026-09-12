@@ -279,13 +279,13 @@ Creates a new client. `id` is DB-generated (`IDENTITY`) — do not include it in
 ```bash
 curl -i -X POST http://localhost:8080/clients \
   -H "Content-Type: application/json" \
-  -d '{ "firstName": "Nadia", "lastName": "Petrenko", "balance": 250.00, "phoneNumber": "+380501234567" }'
+  -d '{ "firstName": "Emily", "lastName": "Carter", "balance": 250.00, "phoneNumber": "+12025550104" }'
 ```
 
 **Response — `201 Created`**, with a `Location: /clients/{id}` header pointing at the new resource:
 
 ```json
-{ "id": 5, "firstName": "Nadia", "lastName": "Petrenko", "balance": 250.00 }
+{ "id": 5, "firstName": "Emily", "lastName": "Carter", "balance": 250.00 }
 ```
 
 **Response — `400 Bad Request`** if `firstName` is blank/missing or `balance` is null/negative (see [Request validation](#request-validation)):
@@ -327,7 +327,7 @@ Full replace of first name, last name, balance, and phone number in one call. Re
 ```bash
 curl -X PUT http://localhost:8080/clients/1/update \
   -H "Content-Type: application/json" \
-  -d '{ "firstName": "Anna", "lastName": "Smith", "balance": 5000.00, "phoneNumber": "+10000000000" }'
+  -d '{ "firstName": "Sarah", "lastName": "Smith", "balance": 5000.00, "phoneNumber": "+12025550105" }'
 ```
 
 Body constraints are the same as `POST /clients` (`firstName` `@NotBlank`, `balance` `@NotNull @PositiveOrZero`), so the same `400` shape applies; a non-existent `{id}` returns `404`.
