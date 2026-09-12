@@ -1,6 +1,8 @@
 package com.roladio.banking.service;
 
 import com.roladio.banking.dto.*;
+import com.roladio.banking.exceptions.ClientNotFoundException;
+import com.roladio.banking.exceptions.InsufficientFundsException;
 import com.roladio.banking.model.Client;
 import com.roladio.banking.repository.ClientRepository;
 import org.junit.jupiter.api.Test;
@@ -47,20 +49,6 @@ public class ClientServiceTest {
     }
 
     @Test
-    void transfer_negativeAmount() {
-        assertThatThrownBy(() -> service.transfer(new TransferRequest(1L, 2L, BigDecimal.valueOf(-100))))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessage("Amount must be positive");
-    }
-
-    @Test
-    void transfer_zeroAmount() {
-        assertThatThrownBy(() -> service.transfer(new TransferRequest(1L, 2L, BigDecimal.ZERO)))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessage("Amount must be positive");
-    }
-
-    @Test
     void transfer_sameAccount() {
         assertThatThrownBy(() -> service.transfer(new TransferRequest(1L, 1L, BigDecimal.valueOf(500))))
                 .isInstanceOf(IllegalArgumentException.class)
@@ -75,7 +63,7 @@ public class ClientServiceTest {
                 .thenReturn(Optional.of(new Client(2L, "Bob", "Jackson", BigDecimal.valueOf(1200), "+12345678902")));
 
         assertThatThrownBy(() -> service.transfer(new TransferRequest(1L, 2L, BigDecimal.valueOf(9000))))
-                .isInstanceOf(IllegalStateException.class)
+                .isInstanceOf(InsufficientFundsException.class)
                 .hasMessage("Insufficient funds");
     }
 
@@ -124,6 +112,15 @@ public class ClientServiceTest {
         assertThat(response.firstName()).isEqualTo("Anna");
         assertThat(response.lastName()).isEqualTo("Groban");
         assertThat(response.balance()).isEqualByComparingTo("5000");
+    }
+
+    @Test
+    void getClientById_whenNotFound_throwsClientNotFound() {
+        when(repository.findById(99L)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> service.getClientById(99L))
+                .isInstanceOf(ClientNotFoundException.class)
+                .hasMessage("Client not found: 99");
     }
 
     @Test

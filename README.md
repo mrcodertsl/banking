@@ -24,6 +24,7 @@ A small Spring Boot REST API for managing bank clients and transferring money be
 | Framework | Spring Boot 4.1.0 (`spring-boot-starter-webmvc`, `spring-boot-starter-data-jpa`) |
 | Database | PostgreSQL (via `org.postgresql:postgresql` driver, runtime scope) |
 | Schema migrations | Flyway (`spring-boot-starter-flyway` + `flyway-database-postgresql`) |
+| Request validation | Jakarta Bean Validation via `spring-boot-starter-validation` (Hibernate Validator 9.1.0.Final) |
 | Boilerplate reduction | Lombok |
 | Build tool | Maven, via the included `./mvnw` / `mvnw.cmd` wrapper (Maven 3.9.16, wrapper 3.3.4 — see `.mvn/wrapper/maven-wrapper.properties`) |
 | Test framework | JUnit 5, Mockito 5.14.2, AssertJ (`spring-boot-starter-webmvc-test`) |
@@ -36,14 +37,16 @@ src/main/java/com/roladio/banking
 ├── BankingApplication.java      # @SpringBootApplication entry point
 ├── controller/
 │   └── ClientController.java    # REST endpoints, mapped under /clients
-├── dto/
-│   ├── ClientRequest.java       # PUT /clients/{id}/update body
-│   ├── ClientResponse.java      # response shape for GET endpoints
-│   ├── LastNameRequest.java     # PATCH .../lastName body
+├── dto/                          # all records; most carry Bean Validation constraints
+│   ├── ClientRequest.java       # POST /clients + PUT /clients/{id}/update body
+│   ├── ClientResponse.java      # response shape for GET endpoints and POST /clients
+│   ├── LastNameRequest.java     # PATCH .../lastName body (no constraints — see API Reference)
 │   ├── PhoneNumberRequest.java  # PATCH .../phoneNumber body
 │   └── TransferRequest.java     # POST /clients/transfer body
 ├── exceptions/
-│   └── GlobalExceptionHandler.java  # @RestControllerAdvice mapping exceptions -> HTTP status
+│   ├── ClientNotFoundException.java     # unchecked; carries "Client not found: <id>" -> 404
+│   ├── InsufficientFundsException.java  # unchecked; carries "Insufficient funds" -> 409
+│   └── GlobalExceptionHandler.java      # @RestControllerAdvice mapping exceptions -> HTTP status
 ├── model/
 │   └── Client.java               # JPA entity mapped to the `client` table
 ├── repository/
@@ -180,6 +183,29 @@ java -jar target/banking-0.0.1-SNAPSHOT.jar
 
 Base path: `/clients`. No authentication, no pagination, no content negotiation beyond JSON.
 
+### Request validation
+
+Request bodies are validated with Jakarta Bean Validation before any handler runs. Constraints live on the DTO records, and controller parameters are annotated `@Valid`:
+
+| DTO | Field | Constraints | Rejection message |
+|---|---|---|---|
+| `ClientRequest` | `firstName` | `@NotBlank` | `must not be blank` |
+| | `lastName` | *(none — column is nullable)* | |
+| | `balance` | `@NotNull` `@PositiveOrZero` | `must not be null` / `must be greater than or equal to 0` |
+| | `phoneNumber` | *(none — column is nullable)* | |
+| `PhoneNumberRequest` | `phoneNumber` | `@NotBlank` | `must not be blank` |
+| `TransferRequest` | `fromId`, `toId` | `@NotNull` | `must not be null` |
+| | `amount` | `@NotNull` `@Positive` | `must not be null` / `must be greater than 0` |
+| `LastNameRequest` | `lastName` | *(none, and the endpoint has no `@Valid`)* | |
+
+The constraints deliberately mirror the DB schema — `@NotBlank firstName` matches `first_name NOT NULL`, and `@PositiveOrZero balance` matches the `balance_non_negative` check constraint — so those violations are now rejected as clean `400`s instead of reaching Postgres and surfacing as a `500`.
+
+A validation failure returns **`400 Bad Request` with a field→message object**, which is a *different shape* from every other error in this API (those use `{ "error": ... }`):
+
+```json
+{ "firstName": "must not be blank", "balance": "must be greater than or equal to 0" }
+```
+
 ### `GET /clients`
 
 Returns every client.
@@ -210,7 +236,7 @@ curl http://localhost:8080/clients/1
 { "id": 1, "firstName": "John", "lastName": "Doe", "balance": 5000.00 }
 ```
 
-**Response — `400 Bad Request`** if `id` doesn't exist:
+**Response — `404 Not Found`** if `id` doesn't exist:
 
 ```json
 { "error": "Client not found: 1" }
@@ -232,7 +258,13 @@ curl -i -X POST http://localhost:8080/clients \
 { "id": 5, "firstName": "Nadia", "lastName": "Petrenko", "balance": 250.00 }
 ```
 
-Note there's no uniqueness or required-field check beyond the DB's own `first_name NOT NULL` and `balance >= 0` constraints — violating either surfaces as a raw, unhandled `DataIntegrityViolationException` (`500`), not a clean `400` (see [Known Issues](#known-issues--limitations)).
+**Response — `400 Bad Request`** if `firstName` is blank/missing or `balance` is null/negative (see [Request validation](#request-validation)):
+
+```json
+{ "firstName": "must not be blank" }
+```
+
+`lastName` and `phoneNumber` are optional, matching their nullable columns. Note that string *length* is still unguarded — a `firstName` over 100 chars or a `phoneNumber` over 20 chars passes validation and fails in Postgres as a `500` (see [Known Issues](#known-issues--limitations)).
 
 ### `PATCH /clients/{id}/phoneNumber`
 
@@ -244,6 +276,8 @@ curl -X PATCH http://localhost:8080/clients/1/phoneNumber \
   -d '{ "phoneNumber": "+10000000000" }'
 ```
 
+`phoneNumber` is `@NotBlank`, so a blank or missing value returns `400`. A non-existent `{id}` returns `404`.
+
 ### `PATCH /clients/{id}/lastName`
 
 Updates a client's last name. Returns `200 OK` with an empty body on success.
@@ -253,6 +287,8 @@ curl -X PATCH http://localhost:8080/clients/1/lastName \
   -H "Content-Type: application/json" \
   -d '{ "lastName": "Smith" }'
 ```
+
+⚠️ This is the **only** body-carrying endpoint without validation: `LastNameRequest` declares no constraints and the handler has no `@Valid`, so `{ "lastName": "" }` or `{}` is accepted and will blank out / null the stored last name. Every sibling endpoint rejects the equivalent input with a `400`.
 
 ### `PUT /clients/{id}/update`
 
@@ -264,7 +300,9 @@ curl -X PUT http://localhost:8080/clients/1/update \
   -d '{ "firstName": "Anna", "lastName": "Smith", "balance": 5000.00, "phoneNumber": "+10000000000" }'
 ```
 
-Note: unlike `transfer`, this endpoint does not go through `@Transactional` save validation beyond what Hibernate's dirty-checking does within the transaction — the entity is mutated and flushed at commit.
+Body constraints are the same as `POST /clients` (`firstName` `@NotBlank`, `balance` `@NotNull @PositiveOrZero`), so the same `400` shape applies; a non-existent `{id}` returns `404`.
+
+Note: unlike `transfer`, this endpoint runs no business-rule checks of its own — the loaded entity is mutated and flushed at commit by Hibernate's dirty-checking. In particular, it can set any client's balance to an arbitrary non-negative value without an offsetting entry.
 
 ### `POST /clients/transfer`
 
@@ -276,14 +314,18 @@ curl -X POST http://localhost:8080/clients/transfer \
   -d '{ "fromId": 1, "toId": 2, "amount": 100.0 }'
 ```
 
-**Validation & errors**
+**Validation & errors**, in the order they are evaluated:
 
-| Condition | Exception thrown | HTTP Status |
-|---|---|---|
-| `amount <= 0` | `IllegalArgumentException("Amount must be positive")` | 400 Bad Request |
-| `fromId.equals(toId)` | `IllegalArgumentException("Cannot transfer to the same account")` | 400 Bad Request |
-| Either client not found | `IllegalArgumentException("Client not found: <id>")` | 400 Bad Request |
-| `from.balance < amount` | `IllegalStateException("Insufficient funds")` | 409 Conflict |
+| # | Condition | Rejected by | HTTP Status | Body |
+|---|---|---|---|---|
+| 1 | `amount` null or `<= 0`, or `fromId`/`toId` null | `@Valid` (Bean Validation) | 400 Bad Request | `{ "amount": "must be greater than 0" }` |
+| 2 | `fromId.equals(toId)` | `ClientService` → `IllegalArgumentException` | 400 Bad Request | `{ "error": "Cannot transfer to the same account" }` |
+| 3 | Either client not found | `ClientService` → `ClientNotFoundException` | 404 Not Found | `{ "error": "Client not found: <id>" }` |
+| 4 | `from.balance < amount` | `ClientService` → `InsufficientFundsException` | 409 Conflict | `{ "error": "Insufficient funds" }` |
+
+Note the same-account rule (#2) is a cross-field check that Bean Validation can't express with field-level constraints, so it stays in the service and keeps the `{ "error": ... }` shape — while the amount rule (#1) moved up to the annotation layer and now returns the field→message shape instead.
+
+`ClientService.transfer` still contains its own `amount <= 0` guard (`IllegalArgumentException("Amount must be positive")`). It is unreachable over HTTP now that `@Positive` rejects the same input first; it remains as defense-in-depth for direct service calls.
 
 The whole transfer runs inside a single `@Transactional` service method — both balance updates are saved together, so a failure partway through rolls back both.
 
@@ -293,10 +335,16 @@ The whole transfer runs inside a single `@Transactional` service method — both
 
 | Exception | Status | Body |
 |---|---|---|
+| `ClientNotFoundException` | `404 Not Found` | `{ "error": "Client not found: <id>" }` |
+| `InsufficientFundsException` | `409 Conflict` | `{ "error": "Insufficient funds" }` |
 | `IllegalArgumentException` | `400 Bad Request` | `{ "error": "<exception message>" }` |
-| `IllegalStateException` | `409 Conflict` | `{ "error": "<exception message>" }` |
+| `MethodArgumentNotValidException` | `400 Bad Request` | `{ "<field>": "<message>", … }` |
 
-Any other unhandled exception (e.g. a database connectivity failure, a malformed JSON body) falls through to Spring Boot's default error handling and is **not** mapped to this `{ "error": ... }` shape.
+Both custom exceptions are unchecked (`RuntimeException`) and build their own message in the constructor, so the throw sites read as `new ClientNotFoundException(id)` / `new InsufficientFundsException()`.
+
+Two body shapes are in play: everything except validation returns `{ "error": ... }`, while `MethodArgumentNotValidException` returns a flat map of field name → constraint message, collected from `getBindingResult().getFieldErrors()` into a `LinkedHashMap` (so field order is preserved). A client parsing errors generically has to handle both.
+
+Any other unhandled exception (e.g. a database connectivity failure, a malformed JSON body, or a `DataIntegrityViolationException` from exceeding a column's length) falls through to Spring Boot's default error handling and is **not** mapped to either shape.
 
 ## Testing
 
@@ -306,12 +354,14 @@ Any other unhandled exception (e.g. a database connectivity failure, a malformed
 
 **Requirements:** a running Docker daemon. You do *not* need a local PostgreSQL — `BankingApplicationTests` starts its own throwaway `postgres:16-alpine` container via Testcontainers, so `./mvnw test` is self-contained and safe to run against a machine with no `banking` database (and it never touches your local data).
 
-Current state: **13 tests, all passing** (1 context test + 12 unit tests).
+Current state: **12 tests, all passing** (1 context test + 11 unit tests).
 
 | Test class | Type | Coverage |
 |---|---|---|
 | `BankingApplicationTests` | Integration test (`@SpringBootTest` + `@Testcontainers`) | `contextLoads()` — boots the full application context against a disposable PostgreSQL container. Because startup runs Flyway and then `ddl-auto=validate`, this single test transitively proves that **V1→V3 apply cleanly to an empty database** and that the resulting schema **matches the `Client` entity**. |
-| `service.ClientServiceTest` | Unit test (Mockito-mocked `ClientRepository`, no DB) | `getAllClients` (mapping, size); `getClientById`; `updatePhoneNumber`; `updateLastName`; `updateClient`; `createClient` (returns the saved client's id and mapped fields); `transfer` — happy path plus negative amount, zero amount, same-account, and insufficient-funds edge cases. Balance assertions use AssertJ's `isEqualByComparingTo` (scale-independent `BigDecimal` comparison) rather than `isEqualTo`. |
+| `service.ClientServiceTest` | Unit test (Mockito-mocked `ClientRepository`, no DB) | `getAllClients` (mapping, size); `getClientById` plus its `ClientNotFoundException` path; `updatePhoneNumber`; `updateLastName`; `updateClient`; `createClient` (returns the saved client's id and mapped fields); `transfer` — happy path plus same-account and insufficient-funds (`InsufficientFundsException`) cases. Balance assertions use AssertJ's `isEqualByComparingTo` (scale-independent `BigDecimal` comparison) rather than `isEqualTo`. |
+
+The negative- and zero-amount transfer tests were removed along with this change: those inputs are now rejected by `@Positive` at the controller boundary, which a service-level unit test can't exercise. That check has effectively moved from a tested service guard to an **untested** annotation — nothing in the suite currently proves `@Valid` is wired up at all (see gaps below).
 
 **How the container is wired up** (`BankingApplicationTests`):
 
@@ -330,7 +380,7 @@ class BankingApplicationTests {
 **Remaining gaps**
 
 - `createClient`'s test only covers mapping a repository-returned `Client` to a `ClientResponse` — it doesn't assert *what* gets passed to `repository.save(...)` (e.g. that `id` is `null` going in).
-- There is no `ClientController` test (no `@WebMvcTest` / MockMvc coverage), even though `spring-boot-starter-webmvc-test` is on the classpath. Controller routing, JSON (de)serialization, `201`/`Location` behavior on `POST /clients`, and the `GlobalExceptionHandler` status mapping are not directly exercised.
+- There is no `ClientController` test (no `@WebMvcTest` / MockMvc coverage), even though `spring-boot-starter-webmvc-test` is on the classpath. Controller routing, JSON (de)serialization, `201`/`Location` behavior on `POST /clients`, **every `@Valid` constraint**, and the `GlobalExceptionHandler` status mapping (including the new `404`/`409`) are not directly exercised. This is now the largest coverage gap, since validation is the layer that most recently absorbed business rules.
 - `spring-boot-starter-data-jpa-test` was added to the POM but is currently unused — no `@DataJpaTest` slice test exists yet, so repository-layer behavior against a real database is untested.
 
 The Maven Surefire plugin is configured with an explicit Mockito Java agent (`-javaagent:.../mockito-core-5.14.2.jar`) and `-Xshare:off`, required for Mockito's inline mock maker to work under recent JDKs.
@@ -345,7 +395,10 @@ The Maven Surefire plugin is configured with an explicit Mockito Java agent (`-j
 
 ## Known Issues & Limitations
 
-- **No request validation**: none of the DTOs use Bean Validation (`@NotBlank`, `@Positive`, etc.) or `@Valid` on controller parameters. Blank/null names, negative balances via `PUT .../update` or `POST /clients` (bypassing the transfer-specific checks), and malformed phone numbers are all accepted by the API layer — the DB's `NOT NULL`/`CHECK (balance >= 0)` constraints are the only backstop, and violating them surfaces as a raw, unhandled `DataIntegrityViolationException` (500) rather than a clean 400.
+- **Validation gaps that remain**: Bean Validation now covers null/blank/sign, but not **string length** — `first_name`/`last_name` are `VARCHAR(100)` and `phone_number` is `VARCHAR(20)` with no matching `@Size`, so an over-long value still reaches Postgres and surfaces as an unhandled `DataIntegrityViolationException` (500). There is also no format check on `phoneNumber` (any non-blank string ≤20 chars is accepted).
+- **`PATCH /clients/{id}/lastName` is unvalidated**: `LastNameRequest` has no constraints and the handler has no `@Valid`, so a blank or absent `lastName` silently blanks the stored value while every other endpoint rejects the equivalent input (see [API Reference](#patch-clientsidlastname)).
+- **Two different error body shapes**: validation failures return `{ "<field>": "<message>" }` while all other errors return `{ "error": "<message>" }`, so clients must parse both (see [Error Handling](#error-handling)).
+- **Dead guard in `ClientService.transfer`**: the `amount <= 0` → `IllegalArgumentException` check is now unreachable over HTTP because `@Positive` rejects that input first. Harmless, but it no longer has test coverage and no longer describes observable API behavior.
 - **`createClient`'s test doesn't verify the saved entity**: it stubs `repository.save(any(Client.class))` and only checks the returned `ClientResponse`, so a bug that dropped a field before calling `save` (e.g. forgetting to copy `phoneNumber`) wouldn't be caught. There's also no controller-level test for `POST /clients` (see [Testing](#testing)).
 - **Mutation endpoints mostly return no representation**: `PATCH`/`PUT`/`POST /transfer` all return `void` (200 OK, empty body) rather than the updated resource — only the new `POST /clients` returns the created representation (`201` + body + `Location` header).
 - **No authentication/authorization**: every endpoint is unauthenticated and unauthorized — anyone who can reach port 8080 can read all client data and move money between any two accounts.

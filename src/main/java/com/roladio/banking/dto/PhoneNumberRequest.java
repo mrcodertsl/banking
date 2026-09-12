@@ -1,3 +1,7 @@
 package com.roladio.banking.dto;
 
-public record PhoneNumberRequest(String phoneNumber) {}
+import jakarta.validation.constraints.NotBlank;
+
+public record PhoneNumberRequest(
+        @NotBlank String phoneNumber
+) {}

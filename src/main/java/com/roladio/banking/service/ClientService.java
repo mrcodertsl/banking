@@ -1,6 +1,8 @@
 package com.roladio.banking.service;
 
 import com.roladio.banking.dto.*;
+import com.roladio.banking.exceptions.ClientNotFoundException;
+import com.roladio.banking.exceptions.InsufficientFundsException;
 import com.roladio.banking.model.Client;
 import com.roladio.banking.repository.ClientRepository;
 import org.springframework.stereotype.Service;
@@ -66,7 +68,7 @@ public class ClientService {
         Client to = findClientById(request.toId());
 
         if (from.getBalance().compareTo(request.amount()) < 0) {
-            throw new IllegalStateException("Insufficient funds");
+            throw new InsufficientFundsException();
         }
 
         from.setBalance(from.getBalance().subtract(request.amount()));
@@ -91,7 +93,7 @@ public class ClientService {
 
     private Client findClientById(Long id) {
         return clientRepository.findById(id)
-                .orElseThrow(() -> new IllegalArgumentException("Client not found: " + id));
+                .orElseThrow(() -> new ClientNotFoundException(id));
     }
 
 }
