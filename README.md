@@ -55,7 +55,8 @@ src/main/java/com/roladio/banking
     └── ClientService.java        # business logic: lookups, updates, transfers
 
 src/main/resources/
-├── application.properties        # datasource + JPA + logging config
+├── application.properties        # base config; datasource via DB_* env vars
+├── application-dev.properties    # `dev` profile: SQL logging only
 └── db/migration/                 # Flyway migration scripts (see below)
 
 src/test/java/com/roladio/banking
@@ -119,42 +120,68 @@ Beyond these 4 seeded rows, new clients can be added at runtime via `POST /clien
 To reset the database from scratch locally:
 
 ```bash
-psql -U tsl -d postgres -c "DROP DATABASE IF EXISTS banking;"
-psql -U tsl -d postgres -c "CREATE DATABASE banking;"
+psql -U postgres -c "DROP DATABASE IF EXISTS banking;"
+psql -U postgres -c "CREATE DATABASE banking;"
 ./mvnw spring-boot:run   # Flyway runs V1, V2, then V3, on startup
 ```
 
 ## Configuration
 
-All configuration is in `src/main/resources/application.properties`:
+Configuration is split across two files: a base `application.properties` that always applies, and an optional `dev` profile that adds SQL logging.
+
+### Base — `src/main/resources/application.properties`
 
 ```properties
 spring.application.name=banking
 
-spring.datasource.url=jdbc:postgresql://localhost:5432/banking
-spring.datasource.username=tsl
-spring.datasource.password=
-spring.datasource.driver-class-name=org.postgresql.Driver
+spring.datasource.url=jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:banking}
+spring.datasource.username=${DB_USER:postgres}
+spring.datasource.password=${DB_PASSWORD:postgres}
 
 spring.jpa.hibernate.ddl-auto=validate
+```
+
+Connection settings are externalized as environment variables with `${VAR:default}` fallbacks, so no credentials need to be edited into the file to run locally, and the same build can be pointed at another database without a rebuild:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DB_HOST` | `localhost` | PostgreSQL host |
+| `DB_PORT` | `5432` | PostgreSQL port |
+| `DB_NAME` | `banking` | Database name |
+| `DB_USER` | `postgres` | Username |
+| `DB_PASSWORD` | `postgres` | Password |
+
+```bash
+DB_USER=tsl DB_PASSWORD=secret ./mvnw spring-boot:run   # override without touching the file
+```
+
+`spring.jpa.hibernate.ddl-auto=validate` means Hibernate validates the entity ↔ table mapping at startup but never creates or alters schema — all schema changes go through Flyway. Note there is no `spring.datasource.driver-class-name`: Spring Boot infers `org.postgresql.Driver` from the `jdbc:postgresql:` URL prefix, so declaring it is redundant.
+
+### `dev` profile — `src/main/resources/application-dev.properties`
+
+```properties
 spring.jpa.show-sql=true
 spring.jpa.properties.hibernate.format_sql=true
 ```
 
-| Property | Effect |
-|---|---|
-| `spring.datasource.url` / `username` / `password` | Connection to your local Postgres instance. Update these to match your setup — the password is currently blank. |
-| `spring.jpa.hibernate.ddl-auto=validate` | Hibernate validates the entity ↔ table mapping at startup but never creates/alters schema. All schema changes must go through Flyway migrations. |
-| `spring.jpa.show-sql` / `hibernate.format_sql` | Logs every SQL statement Hibernate executes, formatted, to stdout. Useful for debugging, noisy in production. |
+SQL logging is **off by default** and only switches on when the `dev` profile is active:
 
-There is no `application-test.properties` / test profile and no per-environment config (dev/staging/prod), so this single file applies everywhere — **except** for the datasource during tests: `BankingApplicationTests` uses Testcontainers' `@ServiceConnection`, which overrides `spring.datasource.*` at runtime to point at a throwaway PostgreSQL container instead of `localhost:5432/banking` (see [Testing](#testing)). Everything else here — `ddl-auto=validate`, SQL logging, Flyway defaults — still applies to the test context.
+```bash
+./mvnw spring-boot:run -Dspring-boot.run.profiles=dev
+# or, for a packaged jar:
+SPRING_PROFILES_ACTIVE=dev java -jar target/banking-0.0.1-SNAPSHOT.jar
+```
+
+### Profiles and tests
+
+There is no `application-test.properties` or `test` profile. `BankingApplicationTests` runs with the base configuration, except that Testcontainers' `@ServiceConnection` overrides `spring.datasource.*` at runtime to point at a throwaway PostgreSQL container — so the `DB_*` variables are irrelevant during tests (see [Testing](#testing)). `ddl-auto=validate` and the Flyway defaults still apply there, which is what makes the context test meaningful.
 
 ## Running the App
 
 **Prerequisites**
 
 - JDK 21
-- A running PostgreSQL server, reachable at `localhost:5432`, with a `banking` database and a user matching `application.properties` (default: user `tsl`, no password)
+- A running PostgreSQL server with a `banking` database, reachable with the settings in [Configuration](#configuration) (defaults: `localhost:5432`, user `postgres`, password `postgres`)
 - No global Maven install required — use the bundled wrapper
 - Docker is **not** needed to run the app, only to run the tests (see [Testing](#testing))
 
@@ -164,12 +191,15 @@ There is no `application-test.properties` / test profile and no per-environment 
    ```bash
    createdb banking
    ```
-2. Update `spring.datasource.username` / `spring.datasource.password` in `application.properties` if your local Postgres role differs from the default.
+2. If your local Postgres doesn't match the defaults, export the relevant `DB_*` variables instead of editing the file:
+   ```bash
+   export DB_USER=tsl DB_PASSWORD=secret
+   ```
 3. Start the app:
    ```bash
    ./mvnw spring-boot:run
    ```
-   On Windows: `mvnw.cmd spring-boot:run`
+   On Windows: `mvnw.cmd spring-boot:run`. Add `-Dspring-boot.run.profiles=dev` to see the SQL it runs.
 4. The API is available at `http://localhost:8080`. Flyway applies any pending migrations (V1 table creation, V2 seed data, V3 seed-data overwrite) automatically before the app finishes starting.
 
 **Building a runnable jar**
@@ -389,7 +419,7 @@ The Maven Surefire plugin is configured with an explicit Mockito Java agent (`-j
 
 - `./mvnw` / `mvnw.cmd` — Maven Wrapper, pinned to Maven 3.9.16 via `.mvn/wrapper/maven-wrapper.properties` (`wrapperVersion=3.3.4`, `distributionType=only-script`). No local Maven install is required.
 - `.gitattributes` forces LF line endings for `mvnw` and CRLF for `*.cmd` files, so the wrapper scripts behave correctly regardless of the contributor's OS/git config.
-- `pom.xml` has empty placeholder blocks for `<name>`, `<description>`, `<url>`, `<licenses>`, `<developers>`, and `<scm>` — these exist only to override (blank out) values inherited from the `spring-boot-starter-parent` POM, not because they're meant to be filled in (see the auto-generated `HELP.md` for Spring Initializr's explanation of this pattern).
+- `pom.xml` declares a real `<name>` and `<description>`. The empty `<url>`, `<licenses>`, `<developers>`, and `<scm>` placeholders that Spring Initializr generates have been removed, so those elements are now **inherited** from `spring-boot-starter-parent` (Apache License 2.0, the Spring team, and Spring Boot's SCM URLs). That only surfaces in the effective POM (`./mvnw help:effective-pom`) and in published artifact metadata; re-add them as empty self-closing tags to suppress the inheritance. `HELP.md` still describes the original override pattern.
 - `HELP.md` is boilerplate generated by Spring Initializr (links to Maven/Spring Boot docs) and isn't project-specific documentation.
 - The Spring Boot Maven plugin excludes Lombok from the final packaged jar (it's a compile-time-only, `optional` dependency).
 
@@ -405,4 +435,5 @@ The Maven Surefire plugin is configured with an explicit Mockito Java agent (`-j
 - **No repository- or controller-layer tests**: the Testcontainers setup proves the context boots and the migrations validate, but no test drives `ClientRepository` against the real database or the endpoints through MockMvc (see [Testing](#testing)).
 - **`spring.jpa.open-in-view` is enabled by default**: Spring logs a warning about this on every startup. It keeps the Hibernate session open for the whole request, which can hide lazy-loading issues and hold DB connections longer than necessary; it's worth setting explicitly to `false`.
 - **No API documentation tooling**: no OpenAPI/Swagger integration — this README is currently the only API reference.
-- **No logging/observability beyond SQL logging**: `spring.jpa.show-sql=true` logs queries, but there's no structured application logging, metrics, or health-check endpoint (no Spring Boot Actuator dependency).
+- **No logging/observability beyond opt-in SQL logging**: the `dev` profile logs queries, but there's no structured application logging, metrics, or health-check endpoint (no Spring Boot Actuator dependency).
+- **Credentials default to `postgres`/`postgres`**: `DB_USER`/`DB_PASSWORD` fall back to a well-known development credential pair. That's convenient locally, but any deployment that forgets to set them starts up with guessable credentials rather than failing fast — dropping the defaults (`${DB_PASSWORD}` with no fallback) would surface the misconfiguration at startup.
