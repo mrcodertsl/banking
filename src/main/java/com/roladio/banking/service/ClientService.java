@@ -76,6 +76,19 @@ public class ClientService {
         clientRepository.save(to);
     }
 
+    @Transactional
+    public ClientResponse createClient(ClientRequest request) {
+        Client client = new Client(null,
+                request.firstName(),
+                request.lastName(),
+                request.balance(),
+                request.phoneNumber());
+
+        Client saved = clientRepository.save(client);
+
+        return new ClientResponse(saved.getId(), saved.getFirstName(), saved.getLastName(), saved.getBalance());
+    }
+
     private Client findClientById(Long id) {
         return clientRepository.findById(id)
                 .orElseThrow(() -> new IllegalArgumentException("Client not found: " + id));

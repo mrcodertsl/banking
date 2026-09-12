@@ -96,6 +96,24 @@ public class ClientServiceTest {
     }
 
     @Test
+    void createClient_returnedSavedClientWithId() {
+        when(repository.save(any(Client.class)))
+                .thenReturn(new Client(5L,
+                        "John",
+                        "Doe",
+                        BigDecimal.valueOf(750),
+                        "+15551234567"));
+
+        ClientResponse response = service.createClient(
+                new ClientRequest("John", "Doe", BigDecimal.valueOf(750), "+15551234567")
+        );
+
+        assertThat(response.id()).isEqualTo(5L);
+        assertThat(response.firstName()).isEqualTo("John");
+        assertThat(response.balance()).isEqualByComparingTo("750");
+    }
+
+    @Test
     void getClientByIdTest() {
         when(repository.findById(1L))
                 .thenReturn(Optional.of(new Client(1L, "Anna", "Groban", BigDecimal.valueOf(5000), "+12345678901")));
