@@ -23,27 +23,24 @@ public class ClientService {
 
     public List<ClientResponse> getAllClients() {
         return clientRepository.findAll().stream()
-                .map(c -> new ClientResponse(c.getId(), c.getFirstName(), c.getLastName(), c.getBalance()))
+                .map(this::toResponse)
                 .collect(Collectors.toList());
     }
 
     public ClientResponse getClientById(Long id) {
-        Client client = findClientById(id);
-        return new ClientResponse(client.getId(), client.getFirstName(), client.getLastName(), client.getBalance());
+        return toResponse(findClientById(id));
     }
 
     @Transactional
     public void updatePhoneNumber(Long id, PhoneNumberRequest request) {
         Client client = findClientById(id);
         client.setPhoneNumber(request.phoneNumber());
-        clientRepository.save(client);
     }
 
     @Transactional
     public void updateLastName(Long id, LastNameRequest request) {
         Client client = findClientById(id);
         client.setLastName(request.lastName());
-        clientRepository.save(client);
     }
 
     @Transactional
@@ -73,9 +70,6 @@ public class ClientService {
 
         from.setBalance(from.getBalance().subtract(request.amount()));
         to.setBalance(to.getBalance().add(request.amount()));
-
-        clientRepository.save(from);
-        clientRepository.save(to);
     }
 
     @Transactional
@@ -88,12 +82,21 @@ public class ClientService {
 
         Client saved = clientRepository.save(client);
 
-        return new ClientResponse(saved.getId(), saved.getFirstName(), saved.getLastName(), saved.getBalance());
+        return toResponse(saved);
     }
 
     private Client findClientById(Long id) {
         return clientRepository.findById(id)
                 .orElseThrow(() -> new ClientNotFoundException(id));
+    }
+
+    private ClientResponse toResponse(Client client) {
+        return new ClientResponse(
+                client.getId(),
+                client.getFirstName(),
+                client.getLastName(),
+                client.getBalance()
+        );
     }
 
 }

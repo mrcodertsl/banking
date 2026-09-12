@@ -59,7 +59,7 @@ public class ClientController {
         clientService.updateLastName(id, request);
     }
 
-    @PutMapping("/{id}/update")
+    @PutMapping("/{id}")
     public void updateClient(@PathVariable Long id,
                              @Valid @RequestBody ClientRequest request) {
         clientService.updateClient(id, request);

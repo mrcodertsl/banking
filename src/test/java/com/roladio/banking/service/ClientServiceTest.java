@@ -49,14 +49,14 @@ public class ClientServiceTest {
     }
 
     @Test
-    void transfer_sameAccount() {
+    void transfer_whenSameAccount_throwsIllegalArgument() {
         assertThatThrownBy(() -> service.transfer(new TransferRequest(1L, 1L, BigDecimal.valueOf(500))))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessage("Cannot transfer to the same account");
     }
 
     @Test
-    void transfer_insufficientFunds() {
+    void transfer_whenInsufficientFunds_throwsInsufficientFunds() {
         when(repository.findById(1L))
                 .thenReturn(Optional.of(new Client(1L, "Anna", "Groban", BigDecimal.valueOf(5000), "+12345678901")));
         when(repository.findById(2L))
@@ -68,19 +68,17 @@ public class ClientServiceTest {
     }
 
     @Test
-    void transfer() {
+    void transfer_movesMoneyBetweenAccounts() {
         Client from = new Client(1L, "Anna", "Groban", BigDecimal.valueOf(5000), "+12345678901");
         Client to   = new Client(2L, "Bob", "Jackson", BigDecimal.valueOf(1200), "+12345678902");
-        when(repository.findById(2L)).thenReturn(Optional.of(from));
-        when(repository.findById(1L)).thenReturn(Optional.of(to));
 
-        service.transfer(new TransferRequest(2L, 1L, BigDecimal.valueOf(50)));
+        when(repository.findById(1L)).thenReturn(Optional.of(from));
+        when(repository.findById(2L)).thenReturn(Optional.of(to));
+
+        service.transfer(new TransferRequest(1L, 2L, BigDecimal.valueOf(50)));
 
         assertThat(from.getBalance()).isEqualByComparingTo("4950");
         assertThat(to.getBalance()).isEqualByComparingTo("1250");
-
-        verify(repository).save(from);
-        verify(repository).save(to);
     }
 
     @Test
@@ -102,7 +100,7 @@ public class ClientServiceTest {
     }
 
     @Test
-    void getClientByIdTest() {
+    void getClientById_returnsClient() {
         when(repository.findById(1L))
                 .thenReturn(Optional.of(new Client(1L, "Anna", "Groban", BigDecimal.valueOf(5000), "+12345678901")));
 
@@ -124,31 +122,27 @@ public class ClientServiceTest {
     }
 
     @Test
-    void updateClientsPhoneNumberTest() {
+    void updatePhoneNumber_updatesPhoneNumber() {
         Client client = new Client(1L, "Anna", "Groban", BigDecimal.valueOf(5000), "+12345678901");
         when(repository.findById(1L)).thenReturn(Optional.of(client));
 
         service.updatePhoneNumber(1L, new PhoneNumberRequest("+00000000000"));
 
         assertThat(client.getPhoneNumber()).isEqualTo("+00000000000");
-
-        verify(repository).save(client);
     }
 
     @Test
-    void updateClientsLastNameTest() {
+    void updateLastName_updatesLastName() {
         Client client = new Client(1L, "Anna", "Groban", BigDecimal.valueOf(5000), "+12345678901");
         when(repository.findById(1L)).thenReturn(Optional.of(client));
 
         service.updateLastName(1L, new LastNameRequest("Test"));
 
         assertThat(client.getLastName()).isEqualTo("Test");
-
-        verify(repository).save(client);
     }
 
     @Test
-    void updateClient() {
+    void updateClient_updatesAllFields() {
         Client client = new Client(1L, "Anna", "Groban", BigDecimal.valueOf(5000), "+12345678901");
         when(repository.findById(1L)).thenReturn(Optional.of(client));
 

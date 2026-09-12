@@ -38,7 +38,7 @@ src/main/java/com/roladio/banking
 ├── controller/
 │   └── ClientController.java    # REST endpoints, mapped under /clients
 ├── dto/                          # all records; most carry Bean Validation constraints
-│   ├── ClientRequest.java       # POST /clients + PUT /clients/{id}/update body
+│   ├── ClientRequest.java       # POST /clients + PUT /clients/{id} body
 │   ├── ClientResponse.java      # response shape for GET endpoints and POST /clients
 │   ├── LastNameRequest.java     # PATCH .../lastName body (no constraints — see API Reference)
 │   ├── PhoneNumberRequest.java  # PATCH .../phoneNumber body
@@ -67,6 +67,8 @@ src/test/java/com/roladio/banking
 All DTOs are Java `record`s (immutable, no validation annotations — see [Known Issues](#known-issues--limitations)). All request/response bodies are plain JSON, there is no API versioning or content negotiation beyond the Spring Boot defaults.
 
 `ClientController` is a thin layer: every method just delegates to `ClientService` and returns whatever it produces — `void` (HTTP 200, empty body) for `PATCH`/`PUT`/`POST /transfer`, and a `ClientResponse` for the `GET` endpoints and `POST /clients` (create).
+
+`ClientService` maps entities to DTOs through a single private `toResponse(Client)` helper, and persists through **JPA dirty checking** rather than explicit saves: every mutating method is `@Transactional` and loads its entity via `findById`, so the entity is managed and Hibernate flushes the changes at commit. Only `createClient` calls `clientRepository.save(...)`, because a brand-new entity has to be made managed first. This means the absence of a `save(...)` call in `updatePhoneNumber`, `updateLastName`, `updateClient`, and `transfer` is deliberate, not an oversight.
 
 ## Data Model
 
@@ -320,19 +322,21 @@ curl -X PATCH http://localhost:8080/clients/1/lastName \
 
 ⚠️ This is the **only** body-carrying endpoint without validation: `LastNameRequest` declares no constraints and the handler has no `@Valid`, so `{ "lastName": "" }` or `{}` is accepted and will blank out / null the stored last name. Every sibling endpoint rejects the equivalent input with a `400`.
 
-### `PUT /clients/{id}/update`
+### `PUT /clients/{id}`
 
 Full replace of first name, last name, balance, and phone number in one call. Returns `200 OK` with an empty body on success.
 
 ```bash
-curl -X PUT http://localhost:8080/clients/1/update \
+curl -X PUT http://localhost:8080/clients/1 \
   -H "Content-Type: application/json" \
   -d '{ "firstName": "Sarah", "lastName": "Smith", "balance": 5000.00, "phoneNumber": "+12025550105" }'
 ```
 
 Body constraints are the same as `POST /clients` (`firstName` `@NotBlank`, `balance` `@NotNull @PositiveOrZero`), so the same `400` shape applies; a non-existent `{id}` returns `404`.
 
-Note: unlike `transfer`, this endpoint runs no business-rule checks of its own — the loaded entity is mutated and flushed at commit by Hibernate's dirty-checking. In particular, it can set any client's balance to an arbitrary non-negative value without an offsetting entry.
+Note: unlike `transfer`, this endpoint applies no business rules beyond the field constraints — in particular it can set any client's balance to an arbitrary non-negative value, with no offsetting entry anywhere.
+
+The path was `PUT /clients/{id}/update` in earlier revisions; the `/update` suffix was dropped so the URL identifies the resource rather than the action.
 
 ### `POST /clients/transfer`
 
@@ -391,7 +395,9 @@ Current state: **12 tests, all passing** (1 context test + 11 unit tests).
 | `BankingApplicationTests` | Integration test (`@SpringBootTest` + `@Testcontainers`) | `contextLoads()` — boots the full application context against a disposable PostgreSQL container. Because startup runs Flyway and then `ddl-auto=validate`, this single test transitively proves that **V1→V3 apply cleanly to an empty database** and that the resulting schema **matches the `Client` entity**. |
 | `service.ClientServiceTest` | Unit test (Mockito-mocked `ClientRepository`, no DB) | `getAllClients` (mapping, size); `getClientById` plus its `ClientNotFoundException` path; `updatePhoneNumber`; `updateLastName`; `updateClient`; `createClient` (returns the saved client's id and mapped fields); `transfer` — happy path plus same-account and insufficient-funds (`InsufficientFundsException`) cases. Balance assertions use AssertJ's `isEqualByComparingTo` (scale-independent `BigDecimal` comparison) rather than `isEqualTo`. |
 
-The negative- and zero-amount transfer tests were removed along with this change: those inputs are now rejected by `@Positive` at the controller boundary, which a service-level unit test can't exercise. That check has effectively moved from a tested service guard to an **untested** annotation — nothing in the suite currently proves `@Valid` is wired up at all (see gaps below).
+Test methods follow a `method_whenCondition_expectedBehavior` naming convention (e.g. `transfer_whenInsufficientFunds_throwsInsufficientFunds`).
+
+The negative- and zero-amount transfer tests were removed when validation moved to the DTOs: those inputs are now rejected by `@Positive` at the controller boundary, which a service-level unit test can't exercise. That check has effectively moved from a tested service guard to an **untested** annotation — nothing in the suite currently proves `@Valid` is wired up at all (see gaps below).
 
 **How the container is wired up** (`BankingApplicationTests`):
 
@@ -411,7 +417,8 @@ class BankingApplicationTests {
 
 - `createClient`'s test only covers mapping a repository-returned `Client` to a `ClientResponse` — it doesn't assert *what* gets passed to `repository.save(...)` (e.g. that `id` is `null` going in).
 - There is no `ClientController` test (no `@WebMvcTest` / MockMvc coverage), even though `spring-boot-starter-webmvc-test` is on the classpath. Controller routing, JSON (de)serialization, `201`/`Location` behavior on `POST /clients`, **every `@Valid` constraint**, and the `GlobalExceptionHandler` status mapping (including the new `404`/`409`) are not directly exercised. This is now the largest coverage gap, since validation is the layer that most recently absorbed business rules.
-- `spring-boot-starter-data-jpa-test` was added to the POM but is currently unused — no `@DataJpaTest` slice test exists yet, so repository-layer behavior against a real database is untested.
+- **Nothing verifies that mutations are actually persisted.** Now that the service relies on dirty checking instead of explicit `save(...)` calls, the unit tests dropped their `verify(repository).save(...)` assertions and only assert that the in-memory entity was mutated. Against a mocked repository those assertions pass whether or not the change would ever reach the database — only a test running in a real transaction (e.g. `@DataJpaTest`) can prove the flush happens.
+- `spring-boot-starter-data-jpa-test` was added to the POM but is currently unused — no `@DataJpaTest` slice test exists yet, so repository-layer behavior against a real database is untested. It is exactly what the gap above calls for.
 
 The Maven Surefire plugin is configured with an explicit Mockito Java agent (`-javaagent:.../mockito-core-5.14.2.jar`) and `-Xshare:off`, required for Mockito's inline mock maker to work under recent JDKs.
 
