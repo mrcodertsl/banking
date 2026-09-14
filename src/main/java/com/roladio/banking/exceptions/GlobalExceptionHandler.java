@@ -50,4 +50,11 @@ public class GlobalExceptionHandler {
 
         return problem;
     }
+
+    @ExceptionHandler(ClientHasBalanceException.class)
+    public ProblemDetail handleClientHasBalance(ClientHasBalanceException ex) {
+        ProblemDetail problem = ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, ex.getMessage());
+        problem.setTitle("Client has a non-zero balance");
+        return problem;
+    }
 }

@@ -20,7 +20,7 @@ public class ClientService {
     }
 
     public List<ClientResponse> getAllClients() {
-        return clientRepository.findAll().stream()
+        return clientRepository.findAllByClosedFalse().stream()
                 .map(this::toResponse)
                 .collect(Collectors.toList());
     }
@@ -79,15 +79,22 @@ public class ClientService {
                 request.firstName(),
                 request.lastName(),
                 request.balance(),
-                request.phoneNumber());
+                request.phoneNumber(),
+                false);
 
         Client saved = clientRepository.save(client);
 
         return toResponse(saved);
     }
 
+    @Transactional
+    public void closeClient(Long id) {
+        Client client = findClientById(id);
+        client.close();
+    }
+
     private Client findClientById(Long id) {
-        return clientRepository.findById(id)
+        return clientRepository.findByIdAndClosedFalse(id)
                 .orElseThrow(() -> new ClientNotFoundException(id));
     }
 

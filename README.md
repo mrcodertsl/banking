@@ -54,13 +54,14 @@ src/main/java/com/roladio/banking
 ├── exceptions/
 │   ├── ClientNotFoundException.java     # unchecked; carries "Client not found: <id>" -> 404
 │   ├── InsufficientFundsException.java  # unchecked; carries "Insufficient funds" -> 409
+│   ├── ClientHasBalanceException.java   # unchecked; blocks closing a funded account -> 409
 │   └── GlobalExceptionHandler.java      # @RestControllerAdvice mapping exceptions -> HTTP status
 ├── model/
 │   └── Client.java               # JPA entity mapped to the `client` table
 ├── repository/
-│   └── ClientRepository.java     # JpaRepository<Client, Long> + a row-locking lookup
+│   └── ClientRepository.java     # JpaRepository + row-locking and closed-filtering lookups
 └── service/
-    └── ClientService.java        # business logic: lookups, updates, transfers
+    └── ClientService.java        # business logic: lookups, updates, transfers, closing
 
 src/main/resources/
 ├── application.properties        # base config; datasource via DB_* env vars
@@ -77,11 +78,11 @@ src/test/java/com/roladio/banking
 
 All DTOs are Java `record`s (immutable, no validation annotations — see [Known Issues](#known-issues--limitations)). All request/response bodies are plain JSON, there is no API versioning or content negotiation beyond the Spring Boot defaults.
 
-`ClientController` is a thin layer: every method just delegates to `ClientService`. The mutating endpoints (`PATCH`/`PUT`/`POST /transfer`) are `void` and annotated `@ResponseStatus(HttpStatus.NO_CONTENT)`, so they answer `204`; the `GET` endpoints return a `ClientResponse` with `200`, and `POST /clients` builds its own `201` response.
+`ClientController` is a thin layer: every method just delegates to `ClientService`. The mutating endpoints (`PATCH`/`PUT`/`DELETE`/`POST /transfer`) are `void` and annotated `@ResponseStatus(HttpStatus.NO_CONTENT)`, so they answer `204`; the `GET` endpoints return a `ClientResponse` with `200`, and `POST /clients` builds its own `201` response.
 
-`ClientService` maps entities to DTOs through a single private `toResponse(Client)` helper, and persists through **JPA dirty checking** rather than explicit saves: every mutating method is `@Transactional` and loads its entity through the repository (`findById`, or the locking `findByIdForUpdate` in `transfer` — see [Concurrency](#concurrency)), so the entity is managed and Hibernate flushes the changes at commit. Only `createClient` calls `clientRepository.save(...)`, because a brand-new entity has to be made managed first. This means the absence of a `save(...)` call in `updatePhoneNumber`, `updateLastName`, `updateClient`, and `transfer` is deliberate, not an oversight.
+`ClientService` maps entities to DTOs through a single private `toResponse(Client)` helper, and persists through **JPA dirty checking** rather than explicit saves: every mutating method is `@Transactional` and loads its entity through the repository (`findByIdAndClosedFalse`, or the locking `findByIdForUpdate` in `transfer` — see [Concurrency](#concurrency)), so the entity is managed and Hibernate flushes the changes at commit. Only `createClient` calls `clientRepository.save(...)`, because a brand-new entity has to be made managed first. This means the absence of a `save(...)` call in `updatePhoneNumber`, `updateLastName`, `updateClient`, and `transfer` is deliberate, not an oversight.
 
-The model is not anemic: `Client` enforces its own balance invariant through `withdraw`/`deposit` (see [Data Model](#data-model)), so the service orchestrates but never performs balance arithmetic or funds checks itself.
+The model is not anemic: `Client` enforces its own invariants through `withdraw`/`deposit`/`close` (see [Data Model](#data-model)), so the service orchestrates but never performs balance arithmetic, funds checks, or closure checks itself.
 
 ## Data Model
 
@@ -96,6 +97,7 @@ Lombok-generated `@Getter` at class level, an `@AllArgsConstructor`, and a `prot
 | `lastName` | `String` | `@Setter` | |
 | `balance` | `BigDecimal` | **`withdraw()` / `deposit()` only** | No setter exists. Exact decimal arithmetic matching the `NUMERIC(19,2)` column; comparisons use `compareTo`, arithmetic uses `add`/`subtract`. |
 | `phoneNumber` | `String` | `@Setter` | |
+| `closed` | `boolean` | **`close()` only** | Soft-delete flag. No setter, and there is no way to reopen a closed client — see [Closing a client](#closing-a-client). |
 
 **`Client` owns the balance invariant.** Rather than exposing a setter and letting callers do the arithmetic, the entity provides two behavior methods:
 
@@ -114,6 +116,31 @@ public void deposit(BigDecimal amount) {
 
 Because there is no `setBalance`, "never go negative" cannot be bypassed from the service layer — `withdraw` is the only path that decreases a balance, and it always checks first. This mirrors the DB's `balance_non_negative` check constraint at the domain level, so the rule is enforced twice and can't drift.
 
+`close()` follows the same pattern for the soft-delete flag — no setter, and the rule lives with the data:
+
+```java
+public void close() {
+    if (balance.compareTo(BigDecimal.ZERO) != 0) {
+        throw new ClientHasBalanceException(id);
+    }
+    closed = true;
+}
+```
+
+### Closing a client
+
+`DELETE /clients/{id}` is a **soft delete**: the row is never removed, it is flagged `closed = true`. A client can only be closed once its balance reaches exactly zero, so money can never be stranded in a closed account.
+
+Closure is enforced at the repository level rather than sprinkled through the service — every lookup filters on the flag:
+
+| Repository method | Used by | Effect |
+|---|---|---|
+| `findAllByClosedFalse()` | `getAllClients` | Closed clients disappear from listings |
+| `findByIdAndClosedFalse(id)` | every single-client read and update | Closed clients read as *not found* |
+| `findByIdForUpdate(id)` | `transfer` | Query carries `and c.closed = false`, so neither side of a transfer can be a closed account |
+
+The consequence is that a closed client becomes indistinguishable from a non-existent one over HTTP — every route reports `404`. The flag is also one-way: nothing in the API reopens an account.
+
 ### `client` table (Postgres, created by `V1__create_client_table.sql`)
 
 | Column | Type | Constraints |
@@ -123,6 +150,7 @@ Because there is no `setBalance`, "never go negative" cannot be bypassed from th
 | `last_name` | `VARCHAR(100)` | nullable |
 | `phone_number` | `VARCHAR(20)` | nullable |
 | `balance` | `NUMERIC(19,2)` | `NOT NULL DEFAULT 0`, plus `CHECK (balance >= 0)` |
+| `closed` | `BOOLEAN` | `NOT NULL DEFAULT FALSE` (added by `V4`) |
 
 `spring.jpa.hibernate.ddl-auto=validate` (see [Configuration](#configuration)) means Hibernate only checks this table matches the `Client` entity at startup — it never creates or alters it. Flyway owns the schema entirely.
 
@@ -135,6 +163,7 @@ Flyway migrations live in `src/main/resources/db/migration` and run automaticall
 | V1 | `V1__create_client_table.sql` | Creates the `client` table (see column list above) with the `balance_non_negative` check constraint. |
 | V2 | `V2__insert_seed_clients.sql` | Seeds 4 sample rows into `client`. |
 | V3 | `V3__update_seed_clients.sql` | Overwrites the first/last name and phone number of the 4 seeded rows (ids 1–4) with different sample data (`John Doe`, `Jane Roe`, `Richard Miles`, `Mary Major`) — balances from `V2` are untouched. |
+| V4 | `V4__add_closed_to_client.sql` | Adds the `closed BOOLEAN NOT NULL DEFAULT FALSE` soft-delete flag; the default leaves every existing row open. |
 
 **`V2` inserts, then `V3` overwrites names/phone numbers on top — net result after both run:**
 
@@ -155,7 +184,7 @@ With Docker Compose, delete the data volume and start over:
 
 ```bash
 docker compose down -v && docker compose up -d
-./mvnw spring-boot:run   # Flyway runs V1, V2, then V3, on startup
+./mvnw spring-boot:run   # Flyway runs V1 through V4 on startup
 ```
 
 Against a server you manage yourself:
@@ -265,7 +294,7 @@ Its environment matches the defaults in `application.properties` exactly, so wit
    ./mvnw spring-boot:run
    ```
    On Windows: `mvnw.cmd spring-boot:run`. Add `-Dspring-boot.run.profiles=dev` to see the SQL it runs.
-4. The API is available at `http://localhost:8080`. Flyway applies any pending migrations (V1 table creation, V2 seed data, V3 seed-data overwrite) automatically before the app finishes starting.
+4. The API is available at `http://localhost:8080`. Flyway applies any pending migrations (V1 table creation, V2 seed data, V3 seed-data overwrite, V4 soft-delete column) automatically before the app finishes starting.
 
 **Building a runnable jar**
 
@@ -292,7 +321,7 @@ public OpenAPI bankingOpenAPI() {
 }
 ```
 
-The emitted document is **OpenAPI 3.1.0** and covers all seven operations and all five DTO schemas. `/swagger-ui.html` is a convenience path — it answers `302` and redirects to `/swagger-ui/index.html`, which is where the UI is actually served.
+The emitted document is **OpenAPI 3.1.0** and covers all eight operations and all five DTO schemas. `/swagger-ui.html` is a convenience path — it answers `302` and redirects to `/swagger-ui/index.html`, which is where the UI is actually served.
 
 > ⚠️ **The generated spec is an explorer, not the full contract.** Three things it does not capture, so this README remains authoritative:
 >
@@ -316,6 +345,7 @@ Base path: `/clients`. No authentication, no pagination, no content negotiation 
 | `PATCH /clients/{id}/phoneNumber` | `204` | `400`, `404` |
 | `PATCH /clients/{id}/lastName` | `204` | `404` |
 | `PUT /clients/{id}` | `204` | `400`, `404` |
+| `DELETE /clients/{id}` | `204` | `404`, `409` |
 | `POST /clients/transfer` | `204` | `400`, `404`, `409` |
 
 Mutating endpoints return `204 No Content` with no body, so a client that needs the updated state must issue a follow-up `GET`. `POST /clients` is the exception: it returns the created representation.
@@ -469,6 +499,29 @@ Balances are only ever changed by `POST /clients/transfer`, which moves money be
 
 The path was `PUT /clients/{id}/update` in earlier revisions; the `/update` suffix was dropped so the URL identifies the resource rather than the action.
 
+### `DELETE /clients/{id}`
+
+Closes a client. Returns `204 No Content` on success. This is a **soft delete** — the row is retained with `closed = true` (see [Closing a client](#closing-a-client)).
+
+```bash
+curl -i -X DELETE http://localhost:8080/clients/4
+```
+
+**Response — `409 Conflict`** if the balance is not exactly zero. Empty the account with a transfer first:
+
+```json
+{
+  "detail": "Cannot close client with a non-zero balance: 1",
+  "instance": "/clients/1",
+  "status": 409,
+  "title": "Client has a non-zero balance"
+}
+```
+
+**Response — `404 Not Found`** if the id does not exist *or the client is already closed*. Note this makes the endpoint **not idempotent** in the HTTP sense: a repeated `DELETE` answers `404`, not `204`.
+
+After closing, the client vanishes from `GET /clients`, `GET /clients/{id}` returns `404`, and it can no longer be either side of a transfer — a transfer naming it fails with `Client not found`.
+
 ### `POST /clients/transfer`
 
 Moves `amount` from `fromId`'s balance to `toId`'s balance. Returns `204 No Content` on success.
@@ -510,6 +563,7 @@ The whole transfer runs inside a single `@Transactional` service method, so if `
 |---|---|---|---|
 | `ClientNotFoundException` | `404 Not Found` | `Client not found` | `Client not found: <id>` |
 | `InsufficientFundsException` | `409 Conflict` | `Insufficient funds` | `Insufficient funds` |
+| `ClientHasBalanceException` | `409 Conflict` | `Client has a non-zero balance` | `Cannot close client with a non-zero balance: <id>` |
 | `IllegalArgumentException` | `400 Bad Request` | `Invalid request` | *(exception message)* |
 | `MethodArgumentNotValidException` | `400 Bad Request` | `Validation error` | `Request validation failed` |
 
@@ -544,7 +598,7 @@ Only `transfer` needs concurrency control, and it is the one operation that gets
 Optional<Client> findByIdForUpdate(@Param("id") Long id);
 ```
 
-`transfer` uses this instead of the plain `findById`, so each account row is locked for the duration of the transaction and a competing transfer blocks until the first commits. The explicit `@Query` is required: Spring Data cannot derive a query from the name `findByIdForUpdate`, since it would try to read `IdForUpdate` as a property path.
+`transfer` uses this instead of the plain `findById`, so each account row is locked for the duration of the transaction and a competing transfer blocks until the first commits. The `and c.closed = false` clause makes the same query enforce the soft-delete rule, so a closed account can't be either side of a transfer. The explicit `@Query` is required: Spring Data cannot derive a query from the name `findByIdForUpdate`, since it would try to read `IdForUpdate` as a property path.
 
 On PostgreSQL, Hibernate renders `PESSIMISTIC_WRITE` as **`FOR NO KEY UPDATE`**, not `FOR UPDATE`:
 
@@ -581,13 +635,13 @@ Since every transfer takes the lower id first, no cycle can form.
 
 **Requirements:** a running Docker daemon. You do *not* need a local PostgreSQL — the Testcontainers-backed tests start their own throwaway `postgres:16-alpine` containers, so `./mvnw test` is self-contained and safe to run against a machine with no `banking` database (and it never touches your local data).
 
-Current state: **19 tests, all passing** (12 unit, 4 controller-slice, 2 integration, 1 context), in about 13 seconds.
+Current state: **22 tests, all passing** (14 unit, 4 controller-slice, 3 integration, 1 context).
 
 | Test class | Type | Coverage |
 |---|---|---|
-| `BankingApplicationTests` | Integration (`@SpringBootTest` + `@Testcontainers`) | `contextLoads()` — boots the full application context against a disposable PostgreSQL container. Because startup runs Flyway and then `ddl-auto=validate`, this single test transitively proves that **V1→V3 apply cleanly to an empty database** and that the resulting schema **matches the `Client` entity**. |
+| `BankingApplicationTests` | Integration (`@SpringBootTest` + `@Testcontainers`) | `contextLoads()` — boots the full application context against a disposable PostgreSQL container. Because startup runs Flyway and then `ddl-auto=validate`, this single test transitively proves that **V1→V4 apply cleanly to an empty database** and that the resulting schema **matches the `Client` entity**. |
 | `service.ClientServiceTest` | Unit (Mockito-mocked `ClientRepository`, no DB) | `getAllClients` (mapping, size); `getClientById` plus its `ClientNotFoundException` path; `updatePhoneNumber`; `updateLastName`; `updateClient`; `createClient` (returns the saved client's id and mapped fields); `transfer` — happy path plus same-account and insufficient-funds cases. Balance assertions use AssertJ's `isEqualByComparingTo` (scale-independent `BigDecimal` comparison) rather than `isEqualTo`. |
-| `service.ClientServiceIntegrationTest` | Integration (`@SpringBootTest` + `@Testcontainers`) | Drives the real `ClientService` against a real database: a transfer moves money and **both balances survive the commit**, and a failed transfer (insufficient funds) **leaves both balances unchanged**, proving the rollback. |
+| `service.ClientServiceIntegrationTest` | Integration (`@SpringBootTest` + `@Testcontainers`) | Drives the real `ClientService` against a real database: a transfer moves money and **both balances survive the commit**; a failed transfer (insufficient funds) **leaves both balances unchanged**, proving the rollback; and closing a client (after draining its balance) **removes it from the listing and makes it read as not-found**. |
 | `controller.ClientControllerTest` | Web slice (`@WebMvcTest(ClientController.class)` + `@MockitoBean` service) | Exercises the HTTP layer with MockMvc and no database: `404` + problem-document `status`/`detail` for an unknown id; `400` with `errors.amount` for a negative amount; `400` with `errors.{fromId,toId,amount}` for an empty body; `409` when the service reports insufficient funds. |
 
 Test methods follow a `method_whenCondition_expectedBehavior` naming convention (e.g. `transfer_whenInsufficientFunds_throwsInsufficientFunds`).
@@ -651,7 +705,7 @@ steps:
 | Dependency cache | `cache: maven` — `setup-java` caches `~/.m2/repository`, keyed on the POM |
 | Command | `./mvnw --batch-mode verify` |
 
-`verify` runs the full lifecycle up to and including packaging, so CI compiles, executes all 19 tests, builds the jar, and repackages it as a Spring Boot executable archive — a stricter gate than `test` alone.
+`verify` runs the full lifecycle up to and including packaging, so CI compiles, executes all 22 tests, builds the jar, and repackages it as a Spring Boot executable archive — a stricter gate than `test` alone.
 
 Two details make this work without extra setup:
 
@@ -675,6 +729,8 @@ Two details make this work without extra setup:
 - **`ClientRequest` serves two endpoints with different semantics**: `balance` seeds the opening balance on `POST /clients`, but is required-and-ignored on `PUT /clients/{id}` (see [API Reference](#put-clientsid)). Splitting it into `CreateClientRequest` / `UpdateClientRequest` would make both contracts honest.
 - **`updateClient_updatesAllFields` is now misnamed**: it no longer asserts anything about balance, because the endpoint no longer changes it — the name promises more than the test checks.
 - **`createClient`'s test doesn't verify the saved entity**: it stubs `repository.save(any(Client.class))` and only checks the returned `ClientResponse`, so a bug that dropped a field before calling `save` (e.g. forgetting to copy `phoneNumber`) wouldn't be caught. `POST /clients` also has no controller-slice or integration coverage, so its `201` and `Location` header are untested (see [Testing](#testing)).
+- **Closing is irreversible and retains all personal data**: `close()` is one-way — no endpoint reopens an account — and the soft delete keeps the name and phone number in the `client` table indefinitely. For an API holding personal data that is a retention decision worth making deliberately, and it means `DELETE /clients/{id}` does *not* satisfy a request to erase someone's data.
+- **`DELETE /clients/{id}` is not idempotent**: repeating it returns `404` rather than `204`, because a closed client is indistinguishable from a missing one (see [API Reference](#delete-clientsid)).
 - **No authentication/authorization**: every endpoint is unauthenticated and unauthorized — anyone who can reach port 8080 can read all client data and move money between any two accounts.
 - **`spring.jpa.open-in-view` is enabled by default**: Spring logs a warning about this on every startup. It keeps the Hibernate session open for the whole request, which can hide lazy-loading issues and hold DB connections longer than necessary; it's worth setting explicitly to `false`.
 - **The generated OpenAPI spec is incomplete**: springdoc now publishes Swagger UI and an OpenAPI 3.1 document, but it reports `200` for `POST /clients` (actually `201`), describes no error responses, and drops the `@Positive`/`@PositiveOrZero` bounds — see [API Documentation](#api-documentation). Until `@ApiResponse`/`@Operation` annotations are added, the spec cannot be used as the contract on its own.

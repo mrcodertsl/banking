@@ -1,6 +1,7 @@
 package com.roladio.banking.service;
 
 import com.roladio.banking.dto.*;
+import com.roladio.banking.exceptions.ClientHasBalanceException;
 import com.roladio.banking.exceptions.ClientNotFoundException;
 import com.roladio.banking.exceptions.InsufficientFundsException;
 import com.roladio.banking.model.Client;
@@ -21,9 +22,11 @@ public class ClientServiceTest {
 
     @Test
     void getAllClients_returnsAllClients() {
-        when(repository.findAll()).thenReturn(List.of(
-                new Client(1L, "Anna", "Groban", BigDecimal.valueOf(5000), "+12345678901"),
-                new Client(2L, "Bob", "Jackson", BigDecimal.valueOf(1200), "+12345678902")
+        when(repository.findAllByClosedFalse()).thenReturn(List.of(
+                new Client(1L, "Anna", "Groban",
+                        BigDecimal.valueOf(5000), "+12345678901", false),
+                new Client(2L, "Bob", "Jackson",
+                        BigDecimal.valueOf(1200), "+12345678902", false)
         ));
 
         List<ClientResponse> result = service.getAllClients();
@@ -35,9 +38,11 @@ public class ClientServiceTest {
 
     @Test
     void getAllClients_mapsFieldsCorrectly() {
-        when(repository.findAll()).thenReturn(List.of(
-                new Client(1L, "Anna", "Groban", BigDecimal.valueOf(5000), "+12345678901"),
-                new Client(2L, "Bob", "Jackson", BigDecimal.valueOf(1200), "+12345678902")
+        when(repository.findAllByClosedFalse()).thenReturn(List.of(
+                new Client(1L, "Anna", "Groban",
+                        BigDecimal.valueOf(5000), "+12345678901", false),
+                new Client(2L, "Bob", "Jackson",
+                        BigDecimal.valueOf(1200), "+12345678902", false)
         ));
 
         List<ClientResponse> result = service.getAllClients();
@@ -58,9 +63,11 @@ public class ClientServiceTest {
     @Test
     void transfer_whenInsufficientFunds_throwsInsufficientFunds() {
         when(repository.findByIdForUpdate(1L))
-                .thenReturn(Optional.of(new Client(1L, "Anna", "Groban", BigDecimal.valueOf(5000), "+12345678901")));
+                .thenReturn(Optional.of(new Client(1L, "Anna", "Groban",
+                        BigDecimal.valueOf(5000), "+12345678901", false)));
         when(repository.findByIdForUpdate(2L))
-                .thenReturn(Optional.of(new Client(2L, "Bob", "Jackson", BigDecimal.valueOf(1200), "+12345678902")));
+                .thenReturn(Optional.of(new Client(2L, "Bob", "Jackson",
+                        BigDecimal.valueOf(1200), "+12345678902", false)));
 
         assertThatThrownBy(() -> service.transfer(new TransferRequest(1L, 2L, BigDecimal.valueOf(9000))))
                 .isInstanceOf(InsufficientFundsException.class)
@@ -69,8 +76,10 @@ public class ClientServiceTest {
 
     @Test
     void transfer_movesMoneyBetweenAccounts() {
-        Client from = new Client(1L, "Anna", "Groban", BigDecimal.valueOf(5000), "+12345678901");
-        Client to   = new Client(2L, "Bob", "Jackson", BigDecimal.valueOf(1200), "+12345678902");
+        Client from = new Client(1L, "Anna", "Groban",
+                BigDecimal.valueOf(5000), "+12345678901", false);
+        Client to   = new Client(2L, "Bob", "Jackson",
+                BigDecimal.valueOf(1200), "+12345678902", false);
 
         when(repository.findByIdForUpdate(1L)).thenReturn(Optional.of(from));
         when(repository.findByIdForUpdate(2L)).thenReturn(Optional.of(to));
@@ -88,7 +97,8 @@ public class ClientServiceTest {
                         "John",
                         "Doe",
                         BigDecimal.valueOf(750),
-                        "+15551234567"));
+                        "+15551234567",
+                        false));
 
         ClientResponse response = service.createClient(
                 new ClientRequest("John", "Doe", BigDecimal.valueOf(750), "+15551234567")
@@ -101,8 +111,9 @@ public class ClientServiceTest {
 
     @Test
     void getClientById_returnsClient() {
-        when(repository.findById(1L))
-                .thenReturn(Optional.of(new Client(1L, "Anna", "Groban", BigDecimal.valueOf(5000), "+12345678901")));
+        when(repository.findByIdAndClosedFalse(1L))
+                .thenReturn(Optional.of(new Client(1L, "Anna", "Groban",
+                        BigDecimal.valueOf(5000), "+12345678901", false)));
 
         ClientResponse response = service.getClientById(1L);
 
@@ -114,7 +125,7 @@ public class ClientServiceTest {
 
     @Test
     void getClientById_whenNotFound_throwsClientNotFound() {
-        when(repository.findById(99L)).thenReturn(Optional.empty());
+        when(repository.findByIdAndClosedFalse(99L)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> service.getClientById(99L))
                 .isInstanceOf(ClientNotFoundException.class)
@@ -123,8 +134,9 @@ public class ClientServiceTest {
 
     @Test
     void updatePhoneNumber_updatesPhoneNumber() {
-        Client client = new Client(1L, "Anna", "Groban", BigDecimal.valueOf(5000), "+12345678901");
-        when(repository.findById(1L)).thenReturn(Optional.of(client));
+        Client client = new Client(1L, "Anna", "Groban",
+                BigDecimal.valueOf(5000), "+12345678901", false);
+        when(repository.findByIdAndClosedFalse(1L)).thenReturn(Optional.of(client));
 
         service.updatePhoneNumber(1L, new PhoneNumberRequest("+00000000000"));
 
@@ -133,8 +145,9 @@ public class ClientServiceTest {
 
     @Test
     void updateLastName_updatesLastName() {
-        Client client = new Client(1L, "Anna", "Groban", BigDecimal.valueOf(5000), "+12345678901");
-        when(repository.findById(1L)).thenReturn(Optional.of(client));
+        Client client = new Client(1L, "Anna", "Groban",
+                BigDecimal.valueOf(5000), "+12345678901", false);
+        when(repository.findByIdAndClosedFalse(1L)).thenReturn(Optional.of(client));
 
         service.updateLastName(1L, new LastNameRequest("Test"));
 
@@ -143,8 +156,9 @@ public class ClientServiceTest {
 
     @Test
     void updateClient_updatesAllFields() {
-        Client client = new Client(1L, "Anna", "Groban", BigDecimal.valueOf(5000), "+12345678901");
-        when(repository.findById(1L)).thenReturn(Optional.of(client));
+        Client client = new Client(1L, "Anna", "Groban",
+                BigDecimal.valueOf(5000), "+12345678901", false);
+        when(repository.findByIdAndClosedFalse(1L)).thenReturn(Optional.of(client));
 
         service.updateClient(1L, new ClientRequest("FN", "LN", BigDecimal.valueOf(1000), "+123"));
 
@@ -155,11 +169,35 @@ public class ClientServiceTest {
 
     @Test
     void withdraw_whenInsufficientFunds_throwsAndLeavesBalanceUnchanged() {
-        Client client = new Client(1L, "Anna", "Groban", BigDecimal.valueOf(100), "+12345678901");
+        Client client = new Client(1L, "Anna", "Groban",
+                BigDecimal.valueOf(100), "+12345678901", false);
 
         assertThatThrownBy(() -> client.withdraw(BigDecimal.valueOf(200)))
                 .isInstanceOf(InsufficientFundsException.class);
 
         assertThat(client.getBalance()).isEqualByComparingTo("100");
+    }
+
+    @Test
+    void closeClient_whenBalanceIsZero_marksClientClosed() {
+        Client client = new Client(1L, "Anna", "Groban",
+                BigDecimal.ZERO, "+12345678901", false);
+        when(repository.findByIdAndClosedFalse(1L)).thenReturn(Optional.of(client));
+
+        service.closeClient(1L);
+
+        assertThat(client.isClosed()).isTrue();
+    }
+
+    @Test
+    void closeClient_whenBalanceIsNotZero_throwsAndLeavesClientOpen() {
+        Client client = new Client(1L, "Anna", "Groban",
+                BigDecimal.valueOf(100), "+12345678901", false);
+        when(repository.findByIdAndClosedFalse(1L)).thenReturn(Optional.of(client));
+
+        assertThatThrownBy(() -> service.closeClient(1L))
+                .isInstanceOf(ClientHasBalanceException.class);
+
+        assertThat(client.isClosed()).isFalse();
     }
 }

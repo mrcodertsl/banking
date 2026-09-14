@@ -69,4 +69,10 @@ public class ClientController {
                              @Valid @RequestBody ClientRequest request) {
         clientService.updateClient(id, request);
     }
+
+    @DeleteMapping("/{id}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    public void closeClient(@PathVariable Long id) {
+        clientService.closeClient(id);
+    }
 }

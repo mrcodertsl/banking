@@ -2,6 +2,7 @@ package com.roladio.banking.service;
 
 import com.roladio.banking.dto.ClientResponse;
 import com.roladio.banking.dto.TransferRequest;
+import com.roladio.banking.exceptions.ClientNotFoundException;
 import com.roladio.banking.exceptions.InsufficientFundsException;
 import com.roladio.banking.repository.ClientRepository;
 import org.junit.jupiter.api.Test;
@@ -58,5 +59,20 @@ class ClientServiceIntegrationTest {
                 .isEqualByComparingTo(fromBefore);
         assertThat(clientRepository.findById(1L).orElseThrow().getBalance())
                 .isEqualByComparingTo(toBefore);
+    }
+
+    @Test
+    void closeClient_removesClientFromListAndMakesItUnavailable() {
+        BigDecimal balance = clientRepository.findById(3L).orElseThrow().getBalance();
+        clientService.transfer(new TransferRequest(3L, 1L, balance));
+
+        int before = clientService.getAllClients().size();
+
+        clientService.closeClient(3L);
+
+        assertThat(clientService.getAllClients()).hasSize(before - 1);
+
+        assertThatThrownBy(() -> clientService.getClientById(3L))
+                .isInstanceOf(ClientNotFoundException.class);
     }
 }
