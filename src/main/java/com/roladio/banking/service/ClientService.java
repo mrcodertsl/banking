@@ -7,7 +7,6 @@ import com.roladio.banking.repository.ClientRepository;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.math.BigDecimal;
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -52,12 +51,23 @@ public class ClientService {
 
     @Transactional
     public void transfer(TransferRequest request) {
-        if (request.fromId().equals(request.toId())) {
+        Long fromId = request.fromId();;
+        Long toId = request.toId();
+
+        if (fromId.equals(toId)) {
             throw new IllegalArgumentException("Cannot transfer to the same account");
         }
 
-        Client from = findClientById(request.fromId());
-        Client to = findClientById(request.toId());
+        Client from;
+        Client to;
+
+        if (fromId < toId) {
+            from = lockClientById(fromId);
+            to = lockClientById(toId);
+        } else {
+            to = lockClientById(toId);
+            from = lockClientById(fromId);
+        }
 
         from.withdraw(request.amount());
         to.deposit(request.amount());
@@ -88,6 +98,11 @@ public class ClientService {
                 client.getLastName(),
                 client.getBalance()
         );
+    }
+
+    private Client lockClientById(Long id) {
+        return clientRepository.findByIdForUpdate(id)
+                .orElseThrow(() -> new ClientNotFoundException(id));
     }
 
 }

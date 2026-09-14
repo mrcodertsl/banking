@@ -57,9 +57,9 @@ public class ClientServiceTest {
 
     @Test
     void transfer_whenInsufficientFunds_throwsInsufficientFunds() {
-        when(repository.findById(1L))
+        when(repository.findByIdForUpdate(1L))
                 .thenReturn(Optional.of(new Client(1L, "Anna", "Groban", BigDecimal.valueOf(5000), "+12345678901")));
-        when(repository.findById(2L))
+        when(repository.findByIdForUpdate(2L))
                 .thenReturn(Optional.of(new Client(2L, "Bob", "Jackson", BigDecimal.valueOf(1200), "+12345678902")));
 
         assertThatThrownBy(() -> service.transfer(new TransferRequest(1L, 2L, BigDecimal.valueOf(9000))))
@@ -72,8 +72,8 @@ public class ClientServiceTest {
         Client from = new Client(1L, "Anna", "Groban", BigDecimal.valueOf(5000), "+12345678901");
         Client to   = new Client(2L, "Bob", "Jackson", BigDecimal.valueOf(1200), "+12345678902");
 
-        when(repository.findById(1L)).thenReturn(Optional.of(from));
-        when(repository.findById(2L)).thenReturn(Optional.of(to));
+        when(repository.findByIdForUpdate(1L)).thenReturn(Optional.of(from));
+        when(repository.findByIdForUpdate(2L)).thenReturn(Optional.of(to));
 
         service.transfer(new TransferRequest(1L, 2L, BigDecimal.valueOf(50)));
 

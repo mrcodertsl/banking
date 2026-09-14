@@ -14,6 +14,7 @@ A small Spring Boot REST API for managing bank clients and transferring money be
 - [Running the App](#running-the-app)
 - [API Reference](#api-reference)
 - [Error Handling](#error-handling)
+- [Concurrency](#concurrency)
 - [Testing](#testing)
 - [Continuous Integration](#continuous-integration)
 - [Build Tooling](#build-tooling)
@@ -53,7 +54,7 @@ src/main/java/com/roladio/banking
 ├── model/
 │   └── Client.java               # JPA entity mapped to the `client` table
 ├── repository/
-│   └── ClientRepository.java     # Spring Data JPA repository (JpaRepository<Client, Long>)
+│   └── ClientRepository.java     # JpaRepository<Client, Long> + a row-locking lookup
 └── service/
     └── ClientService.java        # business logic: lookups, updates, transfers
 
@@ -71,7 +72,7 @@ All DTOs are Java `record`s (immutable, no validation annotations — see [Known
 
 `ClientController` is a thin layer: every method just delegates to `ClientService`. The mutating endpoints (`PATCH`/`PUT`/`POST /transfer`) are `void` and annotated `@ResponseStatus(HttpStatus.NO_CONTENT)`, so they answer `204`; the `GET` endpoints return a `ClientResponse` with `200`, and `POST /clients` builds its own `201` response.
 
-`ClientService` maps entities to DTOs through a single private `toResponse(Client)` helper, and persists through **JPA dirty checking** rather than explicit saves: every mutating method is `@Transactional` and loads its entity via `findById`, so the entity is managed and Hibernate flushes the changes at commit. Only `createClient` calls `clientRepository.save(...)`, because a brand-new entity has to be made managed first. This means the absence of a `save(...)` call in `updatePhoneNumber`, `updateLastName`, `updateClient`, and `transfer` is deliberate, not an oversight.
+`ClientService` maps entities to DTOs through a single private `toResponse(Client)` helper, and persists through **JPA dirty checking** rather than explicit saves: every mutating method is `@Transactional` and loads its entity through the repository (`findById`, or the locking `findByIdForUpdate` in `transfer` — see [Concurrency](#concurrency)), so the entity is managed and Hibernate flushes the changes at commit. Only `createClient` calls `clientRepository.save(...)`, because a brand-new entity has to be made managed first. This means the absence of a `save(...)` call in `updatePhoneNumber`, `updateLastName`, `updateClient`, and `transfer` is deliberate, not an oversight.
 
 The model is not anemic: `Client` enforces its own balance invariant through `withdraw`/`deposit` (see [Data Model](#data-model)), so the service orchestrates but never performs balance arithmetic or funds checks itself.
 
@@ -464,7 +465,7 @@ from.withdraw(request.amount());
 to.deposit(request.amount());
 ```
 
-The whole transfer runs inside a single `@Transactional` service method, so if `withdraw` throws, the transaction rolls back and neither balance is modified.
+The whole transfer runs inside a single `@Transactional` service method, so if `withdraw` throws, the transaction rolls back and neither balance is modified. Both accounts are also row-locked for the duration of the transaction, in a fixed order that rules out deadlocks — see [Concurrency](#concurrency).
 
 ## Error Handling
 
@@ -493,6 +494,49 @@ All four share one envelope, so a client can parse errors generically. The valid
 Both custom exceptions are unchecked (`RuntimeException`) and build their own message in the constructor, so the throw sites read as `new ClientNotFoundException(id)` / `new InsufficientFundsException()`.
 
 Any other unhandled exception (e.g. a database connectivity failure, a malformed JSON body, or a `DataIntegrityViolationException` from exceeding a column's length) falls through to Spring Boot's default error handling. Those responses are *also* `application/problem+json`, but carry Spring's generic title/detail rather than a domain-specific one.
+
+## Concurrency
+
+Only `transfer` needs concurrency control, and it is the one operation that gets it.
+
+**The problem.** A transfer is a read-modify-write on two rows. Two transfers touching the same account concurrently could each read a balance of 5000, each subtract 100, and each write 4900 — one debit silently lost. Because balances are mutated through JPA dirty checking rather than an atomic `UPDATE … SET balance = balance - ?`, nothing in the database prevents that interleaving on its own.
+
+**The fix — lock the rows before reading them.** `ClientRepository` exposes a locking lookup:
+
+```java
+@Lock(LockModeType.PESSIMISTIC_WRITE)
+@Query("select c from Client c where c.id = :id")
+Optional<Client> findByIdForUpdate(@Param("id") Long id);
+```
+
+`transfer` uses this instead of the plain `findById`, so each account row is locked for the duration of the transaction and a competing transfer blocks until the first commits. The explicit `@Query` is required: Spring Data cannot derive a query from the name `findByIdForUpdate`, since it would try to read `IdForUpdate` as a property path.
+
+On PostgreSQL, Hibernate renders `PESSIMISTIC_WRITE` as **`FOR NO KEY UPDATE`**, not `FOR UPDATE`:
+
+```sql
+select c1_0.id, c1_0.balance, c1_0.first_name, c1_0.last_name, c1_0.phone_number
+from client c1_0
+where c1_0.id = ?
+for no key update of c1_0
+```
+
+That is the weaker of the two row-exclusive modes — it still blocks another `FOR NO KEY UPDATE`/`FOR UPDATE` on the same row, which is all that matters here, while leaving `FOR KEY SHARE` (foreign-key checks) unblocked.
+
+**Deadlock avoidance.** Locking two rows invites the classic cycle: a transfer `1 → 2` and a concurrent `2 → 1` could each hold one row and wait forever for the other. `transfer` prevents this by always acquiring locks in ascending id order, regardless of transfer direction:
+
+```java
+if (fromId < toId) {
+    from = lockClientById(fromId);
+    to = lockClientById(toId);
+} else {
+    to = lockClientById(toId);
+    from = lockClientById(fromId);
+}
+```
+
+Since every transfer takes the lower id first, no cycle can form.
+
+**Scope.** `getClientById`, `updatePhoneNumber`, `updateLastName`, and `updateClient` still use the non-locking `findClientById`. That is safe because none of them touch `balance` any more (see [Data Model](#data-model)) — the only field with a concurrency-sensitive invariant is reached solely through `transfer`.
 
 ## Testing
 
@@ -534,6 +578,7 @@ class BankingApplicationTests {
 - `createClient`'s test only covers mapping a repository-returned `Client` to a `ClientResponse` — it doesn't assert *what* gets passed to `repository.save(...)` (e.g. that `id` is `null` going in).
 - There is no `ClientController` test (no `@WebMvcTest` / MockMvc coverage), even though `spring-boot-starter-webmvc-test` is on the classpath. Controller routing, JSON (de)serialization, `201`/`Location` behavior on `POST /clients`, **every `@Valid` constraint**, and the `GlobalExceptionHandler` status mapping (including the new `404`/`409`) are not directly exercised. This is now the largest coverage gap, since validation is the layer that most recently absorbed business rules.
 - **Nothing verifies that mutations are actually persisted.** Now that the service relies on dirty checking instead of explicit `save(...)` calls, the unit tests dropped their `verify(repository).save(...)` assertions and only assert that the in-memory entity was mutated. Against a mocked repository those assertions pass whether or not the change would ever reach the database — only a test running in a real transaction (e.g. `@DataJpaTest`) can prove the flush happens.
+- **The row locking is not exercised by any test.** `ClientServiceTest` mocks `ClientRepository`, so `findByIdForUpdate` is just a stubbed method there — the stubs prove `transfer` *calls* it, not that a lock is taken or that the ordering prevents a deadlock. Verifying that needs two concurrent transactions against a real database, which only a `@DataJpaTest`/Testcontainers test could stage.
 - `spring-boot-starter-data-jpa-test` was added to the POM but is currently unused — no `@DataJpaTest` slice test exists yet, so repository-layer behavior against a real database is untested. It is exactly what the gap above calls for.
 
 The Maven Surefire plugin is configured with an explicit Mockito Java agent (`-javaagent:.../mockito-core-5.14.2.jar`) and `-Xshare:off`, required for Mockito's inline mock maker to work under recent JDKs.
@@ -583,7 +628,6 @@ Two details make this work without extra setup:
 - **`PATCH /clients/{id}/lastName` is unvalidated**: `LastNameRequest` has no constraints and the handler has no `@Valid`, so a blank or absent `lastName` silently blanks the stored value while every other endpoint rejects the equivalent input (see [API Reference](#patch-clientsidlastname)).
 - **`type` is never set on problem documents**: every error leaves `type` at the default `about:blank` (so Spring omits it), meaning `title` is the only machine-readable discriminator between, say, a not-found and an insufficient-funds `409`. Assigning stable `type` URIs would let clients branch on an identifier rather than on display text.
 - **`ClientRequest` serves two endpoints with different semantics**: `balance` seeds the opening balance on `POST /clients`, but is required-and-ignored on `PUT /clients/{id}` (see [API Reference](#put-clientsid)). Splitting it into `CreateClientRequest` / `UpdateClientRequest` would make both contracts honest.
-- **Unused `java.math.BigDecimal` import in `ClientService`**: left behind when the `amount <= 0` guard and the balance arithmetic moved out; the class no longer references `BigDecimal`.
 - **`updateClient_updatesAllFields` is now misnamed**: it no longer asserts anything about balance, because the endpoint no longer changes it — the name promises more than the test checks.
 - **`createClient`'s test doesn't verify the saved entity**: it stubs `repository.save(any(Client.class))` and only checks the returned `ClientResponse`, so a bug that dropped a field before calling `save` (e.g. forgetting to copy `phoneNumber`) wouldn't be caught. There's also no controller-level test for `POST /clients` (see [Testing](#testing)).
 - **No authentication/authorization**: every endpoint is unauthenticated and unauthorized — anyone who can reach port 8080 can read all client data and move money between any two accounts.
