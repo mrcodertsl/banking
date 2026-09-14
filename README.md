@@ -31,7 +31,7 @@ A small Spring Boot REST API for managing bank clients and transferring money be
 | Request validation | Jakarta Bean Validation via `spring-boot-starter-validation` (Hibernate Validator 9.1.0.Final) |
 | Boilerplate reduction | Lombok |
 | Build tool | Maven, via the included `./mvnw` / `mvnw.cmd` wrapper (Maven 3.9.16, wrapper 3.3.4 — see `.mvn/wrapper/maven-wrapper.properties`) |
-| Test framework | JUnit 5, Mockito 5.14.2, AssertJ (`spring-boot-starter-webmvc-test`) |
+| Test framework | JUnit 5, Mockito 5.14.2, AssertJ, MockMvc / `@WebMvcTest` (`spring-boot-starter-webmvc-test`) |
 | Integration testing | Testcontainers 2.0.5 (`spring-boot-testcontainers`, `testcontainers-postgresql`, `testcontainers-junit-jupiter`) — spins up a real PostgreSQL in Docker for the context test |
 
 ## Project Structure
@@ -64,8 +64,11 @@ src/main/resources/
 └── db/migration/                 # Flyway migration scripts (see below)
 
 src/test/java/com/roladio/banking
-├── BankingApplicationTests.java          # context test, backed by a Testcontainers PostgreSQL
-└── service/ClientServiceTest.java        # unit tests for ClientService (Mockito, no DB)
+├── BankingApplicationTests.java                  # context test, backed by a Testcontainers PostgreSQL
+├── controller/ClientControllerTest.java          # @WebMvcTest slice: HTTP status/body, no DB
+└── service/
+    ├── ClientServiceTest.java                    # unit tests (Mockito, no DB)
+    └── ClientServiceIntegrationTest.java         # @SpringBootTest against a real PostgreSQL
 ```
 
 All DTOs are Java `record`s (immutable, no validation annotations — see [Known Issues](#known-issues--limitations)). All request/response bodies are plain JSON, there is no API versioning or content negotiation beyond the Spring Boot defaults.
@@ -544,20 +547,29 @@ Since every transfer takes the lower id first, no cycle can form.
 ./mvnw test
 ```
 
-**Requirements:** a running Docker daemon. You do *not* need a local PostgreSQL — `BankingApplicationTests` starts its own throwaway `postgres:16-alpine` container via Testcontainers, so `./mvnw test` is self-contained and safe to run against a machine with no `banking` database (and it never touches your local data).
+**Requirements:** a running Docker daemon. You do *not* need a local PostgreSQL — the Testcontainers-backed tests start their own throwaway `postgres:16-alpine` containers, so `./mvnw test` is self-contained and safe to run against a machine with no `banking` database (and it never touches your local data).
 
-Current state: **13 tests, all passing** (1 context test + 12 unit tests).
+Current state: **19 tests, all passing** (12 unit, 4 controller-slice, 2 integration, 1 context), in about 13 seconds.
 
 | Test class | Type | Coverage |
 |---|---|---|
-| `BankingApplicationTests` | Integration test (`@SpringBootTest` + `@Testcontainers`) | `contextLoads()` — boots the full application context against a disposable PostgreSQL container. Because startup runs Flyway and then `ddl-auto=validate`, this single test transitively proves that **V1→V3 apply cleanly to an empty database** and that the resulting schema **matches the `Client` entity**. |
-| `service.ClientServiceTest` | Unit test (Mockito-mocked `ClientRepository`, no DB) | `getAllClients` (mapping, size); `getClientById` plus its `ClientNotFoundException` path; `updatePhoneNumber`; `updateLastName`; `updateClient`; `createClient` (returns the saved client's id and mapped fields); `transfer` — happy path plus same-account and insufficient-funds (`InsufficientFundsException`) cases. Balance assertions use AssertJ's `isEqualByComparingTo` (scale-independent `BigDecimal` comparison) rather than `isEqualTo`. |
+| `BankingApplicationTests` | Integration (`@SpringBootTest` + `@Testcontainers`) | `contextLoads()` — boots the full application context against a disposable PostgreSQL container. Because startup runs Flyway and then `ddl-auto=validate`, this single test transitively proves that **V1→V3 apply cleanly to an empty database** and that the resulting schema **matches the `Client` entity**. |
+| `service.ClientServiceTest` | Unit (Mockito-mocked `ClientRepository`, no DB) | `getAllClients` (mapping, size); `getClientById` plus its `ClientNotFoundException` path; `updatePhoneNumber`; `updateLastName`; `updateClient`; `createClient` (returns the saved client's id and mapped fields); `transfer` — happy path plus same-account and insufficient-funds cases. Balance assertions use AssertJ's `isEqualByComparingTo` (scale-independent `BigDecimal` comparison) rather than `isEqualTo`. |
+| `service.ClientServiceIntegrationTest` | Integration (`@SpringBootTest` + `@Testcontainers`) | Drives the real `ClientService` against a real database: a transfer moves money and **both balances survive the commit**, and a failed transfer (insufficient funds) **leaves both balances unchanged**, proving the rollback. |
+| `controller.ClientControllerTest` | Web slice (`@WebMvcTest(ClientController.class)` + `@MockitoBean` service) | Exercises the HTTP layer with MockMvc and no database: `404` + problem-document `status`/`detail` for an unknown id; `400` with `errors.amount` for a negative amount; `400` with `errors.{fromId,toId,amount}` for an empty body; `409` when the service reports insufficient funds. |
 
 Test methods follow a `method_whenCondition_expectedBehavior` naming convention (e.g. `transfer_whenInsufficientFunds_throwsInsufficientFunds`).
 
 `withdraw_whenInsufficientFunds_throwsAndLeavesBalanceUnchanged` exercises the `Client` entity directly with no mocks — it constructs a `Client` and asserts the balance is untouched after a rejected withdrawal. It currently lives in `ClientServiceTest` despite testing the model rather than the service; a separate `ClientTest` would be the natural home as more domain behavior moves into the entity.
 
-The negative- and zero-amount transfer tests were removed when validation moved to the DTOs: those inputs are now rejected by `@Positive` at the controller boundary, which a service-level unit test can't exercise. That check has effectively moved from a tested service guard to an **untested** annotation — nothing in the suite currently proves `@Valid` is wired up at all (see gaps below).
+The negative- and zero-amount transfer tests were removed from `ClientServiceTest` when validation moved to the DTOs: those inputs are rejected by `@Positive` at the controller boundary, which a service-level unit test can't reach. `ClientControllerTest` now covers that boundary instead — `transfer_whenAmountIsNegative_returns400` is the test that proves `@Valid` is actually wired up, and it asserts on `$.errors.amount`, so it also pins the problem-document shape described in [Error Handling](#error-handling).
+
+**Two deliberate choices in `ClientServiceIntegrationTest` are worth preserving:**
+
+- **It is not `@Transactional`.** Annotating the test class would wrap each test in a transaction that rolls back at the end — which would silently destroy the very thing these tests exist to prove. Because they commit for real, they demonstrate that dirty checking actually flushes.
+- **It reads balances before acting** rather than asserting absolute amounts. The tests share a database with each other, and the money-moving test commits, so hard-coding "5000.00" would make them order-dependent. Capturing `fromBefore`/`toBefore` and asserting a *delta* keeps them independent.
+
+They do depend on the Flyway seed data, though: ids 1, 2 and 4 must exist, and **client 4 must have a zero balance** for the insufficient-funds case (`V2` seeds it at `0.0`; `V3` renames it to Mary Major without touching the balance). Changing the seed migrations can break these tests — see [Database & Migrations](#database--migrations).
 
 **How the container is wired up** (`BankingApplicationTests`):
 
@@ -573,13 +585,14 @@ class BankingApplicationTests {
 
 `@Container` manages the container lifecycle (started once for the class, torn down after), and `@ServiceConnection` auto-configures `spring.datasource.*` from it — no manual `@DynamicPropertySource` URL/credential wiring needed. Note `PostgreSQLContainer` is *not* parameterized: Testcontainers 2.x dropped the self-referential generic that 1.x required, and the class now lives in `org.testcontainers.postgresql` (not `org.testcontainers.containers`).
 
+`ClientServiceIntegrationTest` declares its own identical container block. Because each class owns a separate `@Container` field, the two get **two different Spring contexts and two PostgreSQL containers per run** — visible in the build log as two `Creating container for image: postgres:16-alpine` lines. That costs roughly a second of startup and is the obvious next optimization: hoisting the container onto a shared abstract base class (or a `@TestConfiguration` with `@ServiceConnection`) would let both classes reuse one container and one cached context.
+
 **Remaining gaps**
 
-- `createClient`'s test only covers mapping a repository-returned `Client` to a `ClientResponse` — it doesn't assert *what* gets passed to `repository.save(...)` (e.g. that `id` is `null` going in).
-- There is no `ClientController` test (no `@WebMvcTest` / MockMvc coverage), even though `spring-boot-starter-webmvc-test` is on the classpath. Controller routing, JSON (de)serialization, `201`/`Location` behavior on `POST /clients`, **every `@Valid` constraint**, and the `GlobalExceptionHandler` status mapping (including the new `404`/`409`) are not directly exercised. This is now the largest coverage gap, since validation is the layer that most recently absorbed business rules.
-- **Nothing verifies that mutations are actually persisted.** Now that the service relies on dirty checking instead of explicit `save(...)` calls, the unit tests dropped their `verify(repository).save(...)` assertions and only assert that the in-memory entity was mutated. Against a mocked repository those assertions pass whether or not the change would ever reach the database — only a test running in a real transaction (e.g. `@DataJpaTest`) can prove the flush happens.
-- **The row locking is not exercised by any test.** `ClientServiceTest` mocks `ClientRepository`, so `findByIdForUpdate` is just a stubbed method there — the stubs prove `transfer` *calls* it, not that a lock is taken or that the ordering prevents a deadlock. Verifying that needs two concurrent transactions against a real database, which only a `@DataJpaTest`/Testcontainers test could stage.
-- `spring-boot-starter-data-jpa-test` was added to the POM but is currently unused — no `@DataJpaTest` slice test exists yet, so repository-layer behavior against a real database is untested. It is exactly what the gap above calls for.
+- **Lock *contention* is still unproven.** `ClientServiceIntegrationTest` now runs `findByIdForUpdate` against a real PostgreSQL, so the locking query is known to be valid and to acquire a row lock. What no test does is run **two concurrent transactions**, which is what would actually demonstrate that one transfer blocks the other and that the ascending-id ordering prevents a deadlock (see [Concurrency](#concurrency)). That needs a test driving two threads with a barrier between them.
+- Only the `transfer` paths are covered end-to-end. `POST /clients` (`201` + `Location` header), the two `PATCH` endpoints and `PUT /clients/{id}` have no controller-slice or integration coverage — including the required-but-ignored `balance` behavior on `PUT`, which is the project's most surprising contract and rests on documentation alone.
+- `createClient`'s unit test only covers mapping a repository-returned `Client` to a `ClientResponse` — it doesn't assert *what* gets passed to `repository.save(...)` (e.g. that `id` is `null` going in).
+- `spring-boot-starter-data-jpa-test` is still unused — the new tests use `@SpringBootTest` and `@WebMvcTest`, not `@DataJpaTest`, so nothing pulls in that starter. Either add a repository slice test or drop the dependency.
 
 The Maven Surefire plugin is configured with an explicit Mockito Java agent (`-javaagent:.../mockito-core-5.14.2.jar`) and `-Xshare:off`, required for Mockito's inline mock maker to work under recent JDKs.
 
@@ -606,7 +619,7 @@ steps:
 | Dependency cache | `cache: maven` — `setup-java` caches `~/.m2/repository`, keyed on the POM |
 | Command | `./mvnw --batch-mode verify` |
 
-`verify` runs the full lifecycle up to and including packaging, so CI compiles, executes all 13 tests, builds the jar, and repackages it as a Spring Boot executable archive — a stricter gate than `test` alone.
+`verify` runs the full lifecycle up to and including packaging, so CI compiles, executes all 19 tests, builds the jar, and repackages it as a Spring Boot executable archive — a stricter gate than `test` alone.
 
 Two details make this work without extra setup:
 
@@ -629,9 +642,8 @@ Two details make this work without extra setup:
 - **`type` is never set on problem documents**: every error leaves `type` at the default `about:blank` (so Spring omits it), meaning `title` is the only machine-readable discriminator between, say, a not-found and an insufficient-funds `409`. Assigning stable `type` URIs would let clients branch on an identifier rather than on display text.
 - **`ClientRequest` serves two endpoints with different semantics**: `balance` seeds the opening balance on `POST /clients`, but is required-and-ignored on `PUT /clients/{id}` (see [API Reference](#put-clientsid)). Splitting it into `CreateClientRequest` / `UpdateClientRequest` would make both contracts honest.
 - **`updateClient_updatesAllFields` is now misnamed**: it no longer asserts anything about balance, because the endpoint no longer changes it — the name promises more than the test checks.
-- **`createClient`'s test doesn't verify the saved entity**: it stubs `repository.save(any(Client.class))` and only checks the returned `ClientResponse`, so a bug that dropped a field before calling `save` (e.g. forgetting to copy `phoneNumber`) wouldn't be caught. There's also no controller-level test for `POST /clients` (see [Testing](#testing)).
+- **`createClient`'s test doesn't verify the saved entity**: it stubs `repository.save(any(Client.class))` and only checks the returned `ClientResponse`, so a bug that dropped a field before calling `save` (e.g. forgetting to copy `phoneNumber`) wouldn't be caught. `POST /clients` also has no controller-slice or integration coverage, so its `201` and `Location` header are untested (see [Testing](#testing)).
 - **No authentication/authorization**: every endpoint is unauthenticated and unauthorized — anyone who can reach port 8080 can read all client data and move money between any two accounts.
-- **No repository- or controller-layer tests**: the Testcontainers setup proves the context boots and the migrations validate, but no test drives `ClientRepository` against the real database or the endpoints through MockMvc (see [Testing](#testing)).
 - **`spring.jpa.open-in-view` is enabled by default**: Spring logs a warning about this on every startup. It keeps the Hibernate session open for the whole request, which can hide lazy-loading issues and hold DB connections longer than necessary; it's worth setting explicitly to `false`.
 - **No API documentation tooling**: no OpenAPI/Swagger integration — this README is currently the only API reference.
 - **No logging/observability beyond opt-in SQL logging**: the `dev` profile logs queries, but there's no structured application logging, metrics, or health-check endpoint (no Spring Boot Actuator dependency).
