@@ -51,7 +51,7 @@ src/main/java/com/roladio/banking
 │   ├── LastNameRequest.java     # PATCH .../lastName body (no constraints — see API Reference)
 │   ├── PhoneNumberRequest.java  # PATCH .../phoneNumber body
 │   ├── TransferRequest.java     # POST /clients/transfer body
-│   └── TransactionResponse.java # one history entry; no endpoint returns it yet
+│   └── TransactionResponse.java # one entry in GET /clients/{id}/transactions
 ├── exceptions/
 │   ├── ClientNotFoundException.java     # unchecked; carries "Client not found: <id>" -> 404
 │   ├── InsufficientFundsException.java  # unchecked; carries "Insufficient funds" -> 409
@@ -59,7 +59,7 @@ src/main/java/com/roladio/banking
 │   └── GlobalExceptionHandler.java      # @RestControllerAdvice mapping exceptions -> HTTP status
 ├── model/
 │   ├── Client.java               # JPA entity mapped to the `client` table
-│   ├── Transaction.java          # JPA entity for `transaction` — mapped, nothing writes it yet
+│   ├── Transaction.java          # JPA entity for `transaction` — one row written per transfer
 │   └── TransactionType.java      # enum, currently just TRANSFER
 ├── repository/
 │   ├── ClientRepository.java     # JpaRepository + row-locking and closed-filtering lookups
@@ -80,11 +80,11 @@ src/test/java/com/roladio/banking
     └── ClientServiceIntegrationTest.java         # @SpringBootTest against a real PostgreSQL
 ```
 
-All DTOs are Java `record`s (immutable, no validation annotations — see [Known Issues](#known-issues--limitations)). All request/response bodies are plain JSON, there is no API versioning or content negotiation beyond the Spring Boot defaults.
+All DTOs are Java `record`s (immutable; request DTOs carry Bean Validation constraints — see [Request validation](#request-validation)). All request/response bodies are plain JSON, there is no API versioning or content negotiation beyond the Spring Boot defaults.
 
-`ClientController` is a thin layer: every method just delegates to `ClientService`. The mutating endpoints (`PATCH`/`PUT`/`DELETE`/`POST /transfer`) are `void` and annotated `@ResponseStatus(HttpStatus.NO_CONTENT)`, so they answer `204`; the `GET` endpoints return a `ClientResponse` with `200`, and `POST /clients` builds its own `201` response.
+`ClientController` is a thin layer: every method just delegates to `ClientService`. The mutating endpoints (`PATCH`/`PUT`/`DELETE`/`POST /transfer`) are `void` and annotated `@ResponseStatus(HttpStatus.NO_CONTENT)`, so they answer `204`; the `GET` endpoints answer `200` with a `ClientResponse`, a list of them, or — for the history route — a list of `TransactionResponse`, and `POST /clients` builds its own `201` response.
 
-`ClientService` maps entities to DTOs through a single private `toResponse(Client)` helper, and persists through **JPA dirty checking** rather than explicit saves: every mutating method is `@Transactional` and loads its entity through the repository (`findByIdAndClosedFalse`, or the locking `findByIdForUpdate` in `transfer` — see [Concurrency](#concurrency)), so the entity is managed and Hibernate flushes the changes at commit. Only `createClient` calls `clientRepository.save(...)`, because a brand-new entity has to be made managed first. This means the absence of a `save(...)` call in `updatePhoneNumber`, `updateLastName`, `updateClient`, and `transfer` is deliberate, not an oversight.
+`ClientService` maps entities to DTOs through two private helpers, `toResponse(Client)` and `toTransactionResponse(Transaction)`, and persists through **JPA dirty checking** rather than explicit saves: every mutating method is `@Transactional` and loads its entity through the repository (`findByIdAndClosedFalse`, or the locking `findByIdForUpdate` in `transfer` — see [Concurrency](#concurrency)), so the entity is managed and Hibernate flushes the changes at commit. Only `createClient` calls `clientRepository.save(...)`, because a brand-new entity has to be made managed first. This means the absence of a `save(...)` call in `updatePhoneNumber`, `updateLastName`, `updateClient`, and `transfer` is deliberate, not an oversight.
 
 The model is not anemic: `Client` enforces its own invariants through `withdraw`/`deposit`/`close` (see [Data Model](#data-model)), so the service orchestrates but never performs balance arithmetic, funds checks, or closure checks itself.
 
@@ -214,7 +214,9 @@ public record TransactionResponse(
         BigDecimal amount, Instant createdAt) {}
 ```
 
-**No endpoint exposes this yet** — the service method exists, but `ClientController` has no history route, so the history is unreachable over HTTP.
+`ClientController` exposes it as **`GET /clients/{id}/transactions`** (see [API Reference](#get-clientsidtransactions)), a thin delegate like every other route.
+
+`getClientHistory` is not `@Transactional`: the existence check and the history query are two separate reads. Nothing is lazily loaded after the query returns — both parties are already fetched — so the mapping to `TransactionResponse` does not depend on an open session.
 
 > ⚠️ **The query does not use the `V5` indexes.** Because the filter references the *fetched* aliases (`t.from.id`) rather than the transaction's own foreign-key columns, PostgreSQL applies the `OR` as a join filter after joining, and falls back to a full scan of `transaction`. Measured on 40,005 rows where only 5 belong to the client in question:
 >
@@ -242,7 +244,7 @@ Plus `idx_transaction_from_id` and `idx_transaction_to_id`, which is what a "sta
 
 Two things about the shape are worth knowing before building on it:
 
-- **The foreign keys are safe because clients are never physically deleted.** Closing a client is a soft delete (see [Closing a client](#closing-a-client)), so `from_id`/`to_id` can never be orphaned and history survives account closure. Switching to a hard delete later would break this table.
+- **The foreign keys are safe because clients are never physically deleted.** Closing a client is a soft delete (see [Closing a client](#closing-a-client)), so `from_id`/`to_id` can never be orphaned and history survives account closure *in the database*. Over HTTP it only partly survives: a closed client's own `GET /clients/{id}/transactions` answers `404`, but its transfers still appear, with its name, in each counterparty's history. Switching to a hard delete later would break this table.
 - **Both `from_id` and `to_id` are `NOT NULL`, so only two-sided movements fit.** A `type` column implies more kinds are planned, but a one-sided event (deposit, withdrawal, fee) has no second party to name — those would need a nullable column or a sentinel row.
 
 An extra table with no matching entity does not upset `ddl-auto=validate`: Hibernate checks that each entity has a conforming table, not the reverse, so the application starts normally.
@@ -415,12 +417,12 @@ public OpenAPI bankingOpenAPI() {
 }
 ```
 
-The emitted document is **OpenAPI 3.1.0** and covers all eight operations and all five DTO schemas. `/swagger-ui.html` is a convenience path — it answers `302` and redirects to `/swagger-ui/index.html`, which is where the UI is actually served.
+The emitted document is **OpenAPI 3.1.0** and covers all nine operations and all six DTO schemas (`TransactionResponse` included — its `type` is rendered as a string enum `["TRANSFER"]` and `createdAt` as `date-time`). `/swagger-ui.html` is a convenience path — it answers `302` and redirects to `/swagger-ui/index.html`, which is where the UI is actually served.
 
 > ⚠️ **The generated spec is an explorer, not the full contract.** Three things it does not capture, so this README remains authoritative:
 >
 > - **`POST /clients` is documented as `200`, but really returns `201`.** The status is built at runtime by `ResponseEntity.created(...)`, which springdoc cannot infer statically. The four `@ResponseStatus(NO_CONTENT)` endpoints *are* reported correctly as `204`.
-> - **No error responses are described at all** — none of the `400`, `404` or `409` outcomes, nor the RFC 7807 body they carry (see [Error Handling](#error-handling)).
+> - **No error responses are described at all** — none of the `400`, `404` or `409` outcomes (including the `404` from the history route), nor the RFC 7807 body they carry (see [Error Handling](#error-handling)).
 > - **Only some constraints survive.** `@NotBlank`/`@NotNull` become `required` plus `minLength: 1`, but `@Positive` and `@PositiveOrZero` produce no `minimum` — `balance` and `amount` appear as a bare `number`, so the spec does not say they must be non-negative.
 >
 > Adding `@ApiResponse`/`@Operation` annotations to `ClientController` would close all three.
@@ -440,6 +442,7 @@ Base path: `/clients`. No authentication, no pagination, no content negotiation 
 | `PATCH /clients/{id}/lastName` | `204` | `404` |
 | `PUT /clients/{id}` | `204` | `400`, `404` |
 | `DELETE /clients/{id}` | `204` | `404`, `409` |
+| `GET /clients/{id}/transactions` | `200` + array | `404` |
 | `POST /clients/transfer` | `204` | `400`, `404`, `409` |
 
 Mutating endpoints return `204 No Content` with no body, so a client that needs the updated state must issue a follow-up `GET`. `POST /clients` is the exception: it returns the created representation.
@@ -616,6 +619,57 @@ curl -i -X DELETE http://localhost:8080/clients/4
 
 After closing, the client vanishes from `GET /clients`, `GET /clients/{id}` returns `404`, and it can no longer be either side of a transfer — a transfer naming it fails with `Client not found`.
 
+### `GET /clients/{id}/transactions`
+
+Returns every money movement the client took part in — as sender *or* recipient — newest first. Each transfer therefore appears in the history of both parties.
+
+```bash
+curl http://localhost:8080/clients/2/transactions
+```
+
+**Response — `200 OK`** (after transfers `1 → 2` of `100` and then `2 → 3` of `25.50`):
+
+```json
+[
+  {
+    "id": 2, "type": "TRANSFER",
+    "fromId": 2, "fromName": "Jane Roe",
+    "toId": 3, "toName": "Richard Miles",
+    "amount": 25.50, "createdAt": "2026-09-17T12:59:20.636013Z"
+  },
+  {
+    "id": 1, "type": "TRANSFER",
+    "fromId": 1, "fromName": "John Doe",
+    "toId": 2, "toName": "Jane Roe",
+    "amount": 100.00, "createdAt": "2026-09-17T12:59:20.600420Z"
+  }
+]
+```
+
+| Field | Notes |
+|---|---|
+| `type` | Always `TRANSFER` today — the only `TransactionType` constant. |
+| `fromName` / `toName` | `firstName + " " + lastName`, built in `ClientService`. A client without a last name renders as e.g. `"Cher null"` (see [Known Issues](#known-issues--limitations)). |
+| `amount` | Read back from the `NUMERIC(19,2)` column, so always two decimal places (`100.00`), whatever scale the transfer request used. |
+| `createdAt` | ISO-8601 UTC instant with microsecond precision, taken from the database's `now()` at the start of the transfer's transaction. |
+
+There is no sign or direction field: whether an entry is money in or out for *this* client is only derivable by comparing `fromId`/`toId` with the `{id}` in the path.
+
+A client with no transfers gets `200` with `[]`.
+
+**Response — `404 Not Found`** if the id does not exist **or the client is closed** — the lookup goes through the same `findByIdAndClosedFalse` as every other route:
+
+```json
+{
+  "detail": "Client not found: 3",
+  "instance": "/clients/3/transactions",
+  "status": 404,
+  "title": "Client not found"
+}
+```
+
+The list is unpaged — every row for the client comes back in one response (see [Known Issues](#known-issues--limitations)).
+
 ### `POST /clients/transfer`
 
 Moves `amount` from `fromId`'s balance to `toId`'s balance. Returns `204 No Content` on success.
@@ -729,13 +783,13 @@ Since every transfer takes the lower id first, no cycle can form.
 
 **Requirements:** a running Docker daemon. You do *not* need a local PostgreSQL — the Testcontainers-backed tests start their own throwaway `postgres:16-alpine` containers, so `./mvnw test` is self-contained and safe to run against a machine with no `banking` database (and it never touches your local data).
 
-Current state: **22 tests, all passing** (14 unit, 4 controller-slice, 3 integration, 1 context).
+Current state: **25 tests, all passing** (15 unit, 4 controller-slice, 5 integration, 1 context).
 
 | Test class | Type | Coverage |
 |---|---|---|
 | `BankingApplicationTests` | Integration (`@SpringBootTest` + `@Testcontainers`) | `contextLoads()` — boots the full application context against a disposable PostgreSQL container. Because startup runs Flyway and then `ddl-auto=validate`, this single test transitively proves that **V1→V5 apply cleanly to an empty database** and that the resulting schema **matches the `Client` entity**. |
-| `service.ClientServiceTest` | Unit (Mockito-mocked `ClientRepository`, no DB) | `getAllClients` (mapping, size); `getClientById` plus its `ClientNotFoundException` path; `updatePhoneNumber`; `updateLastName`; `updateClient`; `createClient` (returns the saved client's id and mapped fields); `transfer` — happy path plus same-account and insufficient-funds cases. Balance assertions use AssertJ's `isEqualByComparingTo` (scale-independent `BigDecimal` comparison) rather than `isEqualTo`. |
-| `service.ClientServiceIntegrationTest` | Integration (`@SpringBootTest` + `@Testcontainers`) | Drives the real `ClientService` against a real database: a transfer moves money and **both balances survive the commit**; a failed transfer (insufficient funds) **leaves both balances unchanged**, proving the rollback; and closing a client (after draining its balance) **removes it from the listing and makes it read as not-found**. |
+| `service.ClientServiceTest` | Unit (Mockito-mocked `ClientRepository`, no DB) | `getAllClients` (mapping, size); `getClientById` plus its `ClientNotFoundException` path; `updatePhoneNumber`; `updateLastName`; `updateClient`; `createClient` (returns the saved client's id and mapped fields); `transfer` — happy path, same-account and insufficient-funds cases, and `transfer_savesTransactionRecord`, which verifies a `Transaction` is passed to `transactionRepository.save(...)`; `closeClient` with a zero and a non-zero balance. Balance assertions use AssertJ's `isEqualByComparingTo` (scale-independent `BigDecimal` comparison) rather than `isEqualTo`. |
+| `service.ClientServiceIntegrationTest` | Integration (`@SpringBootTest` + `@Testcontainers`) | Drives the real `ClientService` against a real database: a transfer moves money and **both balances survive the commit**; a failed transfer (insufficient funds) **leaves both balances unchanged**, proving the rollback; closing a client (after draining its balance) **removes it from the listing and makes it read as not-found**; a transfer `1 → 2` **appears at the top of client 1's history** with the right ids, amount, a non-null `createdAt` and a resolved `fromName`, and shows up in client 2's history too; and `getClientHistory` for an unknown id throws `ClientNotFoundException`. |
 | `controller.ClientControllerTest` | Web slice (`@WebMvcTest(ClientController.class)` + `@MockitoBean` service) | Exercises the HTTP layer with MockMvc and no database: `404` + problem-document `status`/`detail` for an unknown id; `400` with `errors.amount` for a negative amount; `400` with `errors.{fromId,toId,amount}` for an empty body; `409` when the service reports insufficient funds. |
 
 Test methods follow a `method_whenCondition_expectedBehavior` naming convention (e.g. `transfer_whenInsufficientFunds_throwsInsufficientFunds`).
@@ -769,6 +823,9 @@ class BankingApplicationTests {
 
 **Remaining gaps**
 
+- **`GET /clients/{id}/transactions` has no controller-slice test.** The service method is covered by integration tests, but nothing asserts the HTTP mapping — the `200` array shape or the `404` problem document.
+- **The history tests are shallow in places.** `transfer_savesTransactionRecord` matches `any(Transaction.class)`, so it would pass if the wrong parties, amount or type were recorded; the integration test only asserts client 2's history is non-empty rather than that it contains the transfer; and there is no unit test for `getClientHistory` or for the `TransactionResponse` mapping (including the `null` last-name case). The integration test's `getFirst()` check is reliable despite the shared database only because the test's own transfer is the most recent one.
+- **No test covers history for a closed client** — neither the `404` on its own history nor its transfers remaining visible to a counterparty.
 - **Lock *contention* is still unproven.** `ClientServiceIntegrationTest` now runs `findByIdForUpdate` against a real PostgreSQL, so the locking query is known to be valid and to acquire a row lock. What no test does is run **two concurrent transactions**, which is what would actually demonstrate that one transfer blocks the other and that the ascending-id ordering prevents a deadlock (see [Concurrency](#concurrency)). That needs a test driving two threads with a barrier between them.
 - Only the `transfer` paths are covered end-to-end. `POST /clients` (`201` + `Location` header), the two `PATCH` endpoints and `PUT /clients/{id}` have no controller-slice or integration coverage — including the required-but-ignored `balance` behavior on `PUT`, which is the project's most surprising contract and rests on documentation alone.
 - `createClient`'s unit test only covers mapping a repository-returned `Client` to a `ClientResponse` — it doesn't assert *what* gets passed to `repository.save(...)` (e.g. that `id` is `null` going in).
@@ -799,7 +856,7 @@ steps:
 | Dependency cache | `cache: maven` — `setup-java` caches `~/.m2/repository`, keyed on the POM |
 | Command | `./mvnw --batch-mode verify` |
 
-`verify` runs the full lifecycle up to and including packaging, so CI compiles, executes all 22 tests, builds the jar, and repackages it as a Spring Boot executable archive — a stricter gate than `test` alone.
+`verify` runs the full lifecycle up to and including packaging, so CI compiles, executes all 25 tests, builds the jar, and repackages it as a Spring Boot executable archive — a stricter gate than `test` alone.
 
 Two details make this work without extra setup:
 
@@ -823,10 +880,11 @@ Two details make this work without extra setup:
 - **`ClientRequest` serves two endpoints with different semantics**: `balance` seeds the opening balance on `POST /clients`, but is required-and-ignored on `PUT /clients/{id}` (see [API Reference](#put-clientsid)). Splitting it into `CreateClientRequest` / `UpdateClientRequest` would make both contracts honest.
 - **`updateClient_updatesAllFields` is now misnamed**: it no longer asserts anything about balance, because the endpoint no longer changes it — the name promises more than the test checks.
 - **`createClient`'s test doesn't verify the saved entity**: it stubs `repository.save(any(Client.class))` and only checks the returned `ClientResponse`, so a bug that dropped a field before calling `save` (e.g. forgetting to copy `phoneNumber`) wouldn't be caught. `POST /clients` also has no controller-slice or integration coverage, so its `201` and `Location` header are untested (see [Testing](#testing)).
-- **Transaction history is unreachable over HTTP**: transfers are recorded and `ClientService.getClientHistory` can read them back, but `ClientController` exposes no route, so nothing outside the application can see a statement. The service method also has no test.
-- **`fromName`/`toName` render as `"Cher null"` when a client has no last name**: `TransactionResponse` builds the display name with `getFirstName() + " " + getLastName()`, and `last_name` is nullable with no `@NotBlank` on `ClientRequest.lastName` — so a client created without one is reachable through the public API and its name renders with a literal `null`. Verified end-to-end.
-- **`findHistoryForClient` bypasses the `V5` indexes**: filtering on the fetch-joined aliases makes PostgreSQL scan the whole `transaction` table instead of using `idx_transaction_from_id`/`idx_transaction_to_id` — measured at ~70× slower on 40k rows, degrading further as volume grows. Now that `getClientHistory` calls it, this is on a live path (see [Data Model](#reading-history--transactionrepository)).
-- **Transaction history is unbounded**: `findHistoryForClient` returns every row for a client with no paging or limit, so a long-lived account loads its entire ledger into memory in one list.
+- **A closed client's history is unreachable**: `GET /clients/{id}/transactions` resolves the client through the closed-filtering lookup, so once an account is closed its own statement answers `404`, even though every row survives in the `transaction` table. Its transfers stay visible only from the counterparty's side.
+- **History entries carry no direction**: the response has no in/out indicator or signed amount, so a consumer has to compare `fromId` with the requested id to know whether money arrived or left.
+- **`fromName`/`toName` render as `"Cher null"` when a client has no last name**: `TransactionResponse` builds the display name with `getFirstName() + " " + getLastName()`, and `last_name` is nullable with no `@NotBlank` on `ClientRequest.lastName` — so a client created without one is reachable through the public API and its name renders with a literal `null`. Verified end-to-end through `GET /clients/{id}/transactions`.
+- **`findHistoryForClient` bypasses the `V5` indexes**: filtering on the fetch-joined aliases makes PostgreSQL scan the whole `transaction` table instead of using `idx_transaction_from_id`/`idx_transaction_to_id` — measured at ~70× slower on 40k rows, degrading further as volume grows. Now that `GET /clients/{id}/transactions` calls it, this is on a live, public path (see [Data Model](#reading-history--transactionrepository)).
+- **Transaction history is unbounded**: `findHistoryForClient` returns every row for a client with no paging or limit, and `GET /clients/{id}/transactions` serializes the whole list, so a long-lived account loads and sends its entire ledger in one response. Combined with the unindexed query above and the lack of authentication, this is also the cheapest endpoint to make expensive.
 - **Closing is irreversible and retains all personal data**: `close()` is one-way — no endpoint reopens an account — and the soft delete keeps the name and phone number in the `client` table indefinitely. For an API holding personal data that is a retention decision worth making deliberately, and it means `DELETE /clients/{id}` does *not* satisfy a request to erase someone's data.
 - **`DELETE /clients/{id}` is not idempotent**: repeating it returns `404` rather than `204`, because a closed client is indistinguishable from a missing one (see [API Reference](#delete-clientsid)).
 - **No authentication/authorization**: every endpoint is unauthenticated and unauthorized — anyone who can reach port 8080 can read all client data and move money between any two accounts.

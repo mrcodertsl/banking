@@ -1,6 +1,7 @@
 package com.roladio.banking.service;
 
 import com.roladio.banking.dto.ClientResponse;
+import com.roladio.banking.dto.TransactionResponse;
 import com.roladio.banking.dto.TransferRequest;
 import com.roladio.banking.exceptions.ClientNotFoundException;
 import com.roladio.banking.exceptions.InsufficientFundsException;
@@ -14,6 +15,7 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 
 import java.math.BigDecimal;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -73,6 +75,30 @@ class ClientServiceIntegrationTest {
         assertThat(clientService.getAllClients()).hasSize(before - 1);
 
         assertThatThrownBy(() -> clientService.getClientById(3L))
+                .isInstanceOf(ClientNotFoundException.class);
+    }
+
+    @Test
+    void getClientHistory_returnsTransferForBothParticipants() {
+        clientService.transfer(new TransferRequest(1L, 2L, new BigDecimal("25.00")));
+
+        List<TransactionResponse> fromHistory = clientService.getClientHistory(1L);
+        List<TransactionResponse> toHistory = clientService.getClientHistory(2L);
+
+        assertThat(fromHistory).isNotEmpty();
+        assertThat(toHistory).isNotEmpty();
+
+        TransactionResponse latest = fromHistory.getFirst();
+        assertThat(latest.fromId()).isEqualTo(1L);
+        assertThat(latest.toId()).isEqualTo(2L);
+        assertThat(latest.amount()).isEqualByComparingTo("25.00");
+        assertThat(latest.createdAt()).isNotNull();
+        assertThat(latest.fromName()).isNotBlank();
+    }
+
+    @Test
+    void getClientHistory_whenClientDoesNotExist_throwsClientNotFound() {
+        assertThatThrownBy(() -> clientService.getClientHistory(999L))
                 .isInstanceOf(ClientNotFoundException.class);
     }
 }

@@ -5,6 +5,7 @@ import com.roladio.banking.exceptions.ClientHasBalanceException;
 import com.roladio.banking.exceptions.ClientNotFoundException;
 import com.roladio.banking.exceptions.InsufficientFundsException;
 import com.roladio.banking.model.Client;
+import com.roladio.banking.model.Transaction;
 import com.roladio.banking.repository.ClientRepository;
 import com.roladio.banking.repository.TransactionRepository;
 import org.junit.jupiter.api.Test;
@@ -201,5 +202,20 @@ public class ClientServiceTest {
                 .isInstanceOf(ClientHasBalanceException.class);
 
         assertThat(client.isClosed()).isFalse();
+    }
+
+    @Test
+    void transfer_savesTransactionRecord() {
+        Client from = new Client(1L, "Anna", "Groban",
+                BigDecimal.valueOf(5000), "+12345678901", false);
+        Client to   = new Client(2L, "Bob", "Jackson",
+                BigDecimal.valueOf(1200), "+12345678902", false);
+
+        when(repository.findByIdForUpdate(1L)).thenReturn(Optional.of(from));
+        when(repository.findByIdForUpdate(2L)).thenReturn(Optional.of(to));
+
+        service.transfer(new TransferRequest(1L, 2L, BigDecimal.valueOf(50)));
+
+        verify(transactionRepository).save(any(Transaction.class));
     }
 }

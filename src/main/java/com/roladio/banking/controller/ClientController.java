@@ -75,4 +75,9 @@ public class ClientController {
     public void closeClient(@PathVariable Long id) {
         clientService.closeClient(id);
     }
+
+    @GetMapping("/{id}/transactions")
+    public List<TransactionResponse> getClientHistory(@PathVariable Long id) {
+        return clientService.getClientHistory(id);
+    }
 }
