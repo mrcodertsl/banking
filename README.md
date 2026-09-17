@@ -11,6 +11,7 @@ A small Spring Boot REST API for managing bank clients and transferring money be
 - [Data Model](#data-model)
 - [Database & Migrations](#database--migrations)
 - [Configuration](#configuration)
+- [AI Integration (Spring AI + Ollama)](#ai-integration-spring-ai--ollama)
 - [Running the App](#running-the-app)
 - [API Documentation](#api-documentation)
 - [API Reference](#api-reference)
@@ -34,6 +35,7 @@ A small Spring Boot REST API for managing bank clients and transferring money be
 | Boilerplate reduction | Lombok |
 | Build tool | Maven, via the included `./mvnw` / `mvnw.cmd` wrapper (Maven 3.9.16, wrapper 3.3.4 — see `.mvn/wrapper/maven-wrapper.properties`) |
 | Test framework | JUnit 5, Mockito 5.14.2, AssertJ, MockMvc / `@WebMvcTest` (`spring-boot-starter-webmvc-test`) |
+| LLM client | Spring AI 2.0.1 (`spring-ai-starter-model-ollama`, versions from the imported `spring-ai-bom`) talking to a local [Ollama](https://ollama.com) server — configured but not yet used by any code; see [AI Integration](#ai-integration-spring-ai--ollama) |
 | Integration testing | Testcontainers 2.0.5 (`spring-boot-testcontainers`, `testcontainers-postgresql`, `testcontainers-junit-jupiter`) — spins up a real PostgreSQL in Docker for the context test |
 
 ## Project Structure
@@ -405,7 +407,14 @@ spring.datasource.username=${DB_USER:postgres}
 spring.datasource.password=${DB_PASSWORD:postgres}
 
 spring.jpa.hibernate.ddl-auto=validate
+
+spring.ai.ollama.base-url=${OLLAMA_URL:http://localhost:11434}
+spring.ai.ollama.chat.model=qwen2.5:3b
+spring.ai.ollama.chat.options.temperature=0.0
+spring.ai.ollama.init.pull-model-strategy=never
 ```
+
+The `spring.ai.ollama.*` block is explained in [AI Integration](#ai-integration-spring-ai--ollama).
 
 Connection settings are externalized as environment variables with `${VAR:default}` fallbacks, so no credentials need to be edited into the file to run locally, and the same build can be pointed at another database without a rebuild:
 
@@ -416,6 +425,7 @@ Connection settings are externalized as environment variables with `${VAR:defaul
 | `DB_NAME` | `banking` | Database name |
 | `DB_USER` | `postgres` | Username |
 | `DB_PASSWORD` | `postgres` | Password |
+| `OLLAMA_URL` | `http://localhost:11434` | Ollama server base URL |
 
 ```bash
 DB_USER=tsl DB_PASSWORD=secret ./mvnw spring-boot:run   # override without touching the file
@@ -442,6 +452,56 @@ SPRING_PROFILES_ACTIVE=dev java -jar target/banking-0.0.1-SNAPSHOT.jar
 
 There is no `application-test.properties` or `test` profile. `BankingApplicationTests` runs with the base configuration, except that Testcontainers' `@ServiceConnection` overrides `spring.datasource.*` at runtime to point at a throwaway PostgreSQL container — so the `DB_*` variables are irrelevant during tests (see [Testing](#testing)). `ddl-auto=validate` and the Flyway defaults still apply there, which is what makes the context test meaningful.
 
+## AI Integration (Spring AI + Ollama)
+
+The project now has an LLM client wired in, but **nothing in the application uses it yet**: no controller, service or test injects a `ChatModel` or `ChatClient`. What exists is the dependency, its configuration, and an Ollama server in Docker Compose.
+
+**Dependency.** `pom.xml` adds `spring-ai-starter-model-ollama` without a version, and imports `org.springframework.ai:spring-ai-bom:2.0.1` in a new `<dependencyManagement>` block to supply it. The starter brings in the Ollama client plus Spring AI's chat-client, chat-memory, tool-calling, retry and observation auto-configuration.
+
+**Beans created at startup.** Because of that auto-configuration, every application context — including the test contexts — now contains, among others:
+
+| Bean | Type |
+|---|---|
+| `ollamaApi` | `OllamaApi` — the HTTP client for `spring.ai.ollama.base-url` |
+| `ollamaChatModel` | `OllamaChatModel` — the injectable `ChatModel` |
+| `chatClientBuilder` | `ChatClient.Builder` — the fluent API most code would start from |
+| `ollamaEmbeddingModel` | `OllamaEmbeddingModel` — created too, though no embedding model is configured |
+| `chatMemory` | `MessageWindowChatMemory` over an `InMemoryChatMemoryRepository` |
+| `toolCallingManager` | `DefaultToolCallingManager` |
+
+Creating these beans makes **no network call**, so the application starts, and all 25 tests pass, with no Ollama server running. Verified by running the full suite with `OLLAMA_URL` pointed at a closed port. CI therefore needs no changes.
+
+**Configuration.**
+
+| Property | Value | Effect |
+|---|---|---|
+| `spring.ai.ollama.base-url` | `${OLLAMA_URL:http://localhost:11434}` | Where Ollama is reached. The fallback is Spring AI's own default; the line exists to allow the `OLLAMA_URL` override. |
+| `spring.ai.ollama.chat.model` | `qwen2.5:3b` | Qwen 2.5, 3.1B parameters, `Q4_K_M` quantization, about 1.9 GB on disk, 32k context. |
+| `spring.ai.ollama.chat.options.temperature` | `0.0` | Always pick the most likely token, so the same prompt gives (near-)identical output — suited to extraction or classification rather than creative text. |
+| `spring.ai.ollama.init.pull-model-strategy` | `never` | The app never downloads the model itself; it must already be present in Ollama. `never` is also Spring AI's default, so this line only makes the choice explicit. |
+
+**Ollama in Docker Compose.** `docker-compose.yml` gains a second service:
+
+| Setting | Value |
+|---|---|
+| Image | `ollama/ollama:latest` — about 2.8 GB, **not pinned** (`0.34.1` at the time of writing) |
+| Container name | `banking-ollama` |
+| Host port | `11434` |
+| Data volume | named volume `ollama-data` at `/root/.ollama`, so pulled models survive `down` but not `down -v` |
+| Healthcheck | none |
+
+**Getting a working model.** With `pull-model-strategy=never`, starting the container is not enough — the model has to be pulled once:
+
+```bash
+docker compose up -d ollama
+docker exec banking-ollama ollama pull qwen2.5:3b     # ~1.9 GB, once per volume
+curl http://localhost:11434/api/tags                  # should list qwen2.5:3b
+```
+
+Verified end-to-end against that container: a `ChatClient` call with the prompt "Reply with exactly the word OK." returned `OK` — 4.7 s on the first call while the model loaded into memory, 187 ms on the next.
+
+> ⚠️ **A call to an unreachable Ollama blocks for about 19 minutes before failing.** Spring AI's retry defaults apply to every model call: `spring.ai.retry.max-attempts=10`, an initial back-off of 2 s multiplied by 5 each time, capped at 3 minutes. Observed against a closed port: retries after 2 s, 10 s, 50 s, then every 180 s. Nine waits add up to roughly 1,140 s on the calling thread — in a web request, far longer than any client will wait. Lowering `spring.ai.retry.max-attempts` and `spring.ai.retry.backoff.max-interval` before building a feature on it is advisable.
+
 ## Running the App
 
 **Prerequisites**
@@ -450,13 +510,15 @@ There is no `application-test.properties` or `test` profile. `BankingApplication
 - A PostgreSQL server with a `banking` database, reachable with the settings in [Configuration](#configuration) (defaults: `localhost:5432`, user `postgres`, password `postgres`). The bundled Docker Compose file provides exactly that — see below.
 - No global Maven install required — use the bundled wrapper
 - Docker is needed for the Compose database and for the tests (see [Testing](#testing)), but not to run the app itself against an existing PostgreSQL
+- Ollama is **not** required: the app starts without it, and nothing calls it yet (see [AI Integration](#ai-integration-spring-ai--ollama))
 
 ### Starting PostgreSQL with Docker Compose
 
-`docker-compose.yml` at the project root stands up a matching database:
+`docker-compose.yml` at the project root stands up a matching database — and, since the Spring AI change, an Ollama server as well:
 
 ```bash
-docker compose up -d          # start Postgres in the background
+docker compose up -d postgres # start only Postgres in the background
+docker compose up -d          # start Postgres and Ollama
 docker compose ps             # check it reports (healthy)
 docker compose down           # stop it, keeping the data
 docker compose down -v        # stop it and delete the data volume
@@ -473,7 +535,9 @@ docker compose down -v        # stop it and delete the data volume
 
 Its environment matches the defaults in `application.properties` exactly, so with Compose running you need no `DB_*` variables at all — `./mvnw spring-boot:run` connects as-is.
 
-> **Port conflict:** the file publishes host port `5432`. If you already run PostgreSQL locally on that port, `docker compose up` fails with "port is already allocated". Either stop the local server, or publish a different host port (e.g. `"55432:5432"`) and start the app with `DB_PORT=55432`.
+A plain `docker compose up -d` now also starts `banking-ollama`, which downloads the ~2.8 GB `ollama/ollama` image on first use. Since nothing calls it yet, `docker compose up -d postgres` is enough to run the app. See [AI Integration](#ai-integration-spring-ai--ollama) for the Ollama service.
+
+> **Port conflict:** the file publishes host port `5432`. If you already run PostgreSQL locally on that port, `docker compose up` fails with "port is already allocated". Either stop the local server, or publish a different host port (e.g. `"55432:5432"`) and start the app with `DB_PORT=55432`. The same applies to Ollama on `11434` — commonly already taken by the native Ollama desktop app — using e.g. `"11435:11434"` and `OLLAMA_URL=http://localhost:11435`.
 
 **Steps**
 
@@ -974,7 +1038,8 @@ Two details make this work without extra setup:
 - `.gitattributes` forces LF line endings for `mvnw` and CRLF for `*.cmd` files, so the wrapper scripts behave correctly regardless of the contributor's OS/git config.
 - `pom.xml` declares a real `<name>` and `<description>`. The empty `<url>`, `<licenses>`, `<developers>`, and `<scm>` placeholders that Spring Initializr generates have been removed, so those elements are now **inherited** from `spring-boot-starter-parent` (Apache License 2.0, the Spring team, and Spring Boot's SCM URLs). That only surfaces in the effective POM (`./mvnw help:effective-pom`) and in published artifact metadata; re-add them as empty self-closing tags to suppress the inheritance.
 - `.github/workflows/build.yml` is the only CI configuration — see [Continuous Integration](#continuous-integration).
-- `docker-compose.yml` provisions the local PostgreSQL only — the application itself is not containerized, so there is no `Dockerfile` and no app service in the Compose file. `docker compose up -d` then `./mvnw spring-boot:run` is the intended local loop (see [Running the App](#starting-postgresql-with-docker-compose)).
+- `docker-compose.yml` provisions the local PostgreSQL and an Ollama server — the application itself is not containerized, so there is no `Dockerfile` and no app service in the Compose file. `docker compose up -d` then `./mvnw spring-boot:run` is the intended local loop (see [Running the App](#starting-postgresql-with-docker-compose)).
+- `pom.xml` now has a `<dependencyManagement>` section, used solely to import `spring-ai-bom` 2.0.1, so Spring AI artifacts are declared without versions.
 - The Spring Boot Maven plugin excludes Lombok from the final packaged jar (it's a compile-time-only, `optional` dependency).
 
 ## Known Issues & Limitations
@@ -997,6 +1062,11 @@ Two details make this work without extra setup:
 - **Transaction history is unbounded**: `findHistoryForClient` returns every row for a client with no paging or limit, and `GET /clients/{id}/transactions` serializes the whole list, so a long-lived account loads and sends its entire ledger in one response. Combined with the unindexed query above and the lack of authentication, this is also the cheapest endpoint to make expensive.
 - **Closing is irreversible and retains all personal data**: `close()` is one-way — no endpoint reopens an account — and the soft delete keeps the name and phone number in the `client` table indefinitely. For an API holding personal data that is a retention decision worth making deliberately, and it means `DELETE /clients/{id}` does *not* satisfy a request to erase someone's data.
 - **`DELETE /clients/{id}` is not idempotent**: repeating it returns `404` rather than `204`, because a closed client is indistinguishable from a missing one (see [API Reference](#delete-clientsid)).
+- **Spring AI is configured but unused**: the starter adds a chat model, embedding model, chat client, chat memory and tool-calling beans to every context, and Compose adds a ~2.8 GB image, with no code calling any of it yet.
+- **Model calls to an unavailable Ollama hang for ~19 minutes**: Spring AI's default retry (10 attempts, back-off up to 3 minutes) runs on the caller's thread, so the first feature built on it will tie up request threads if Ollama is down (see [AI Integration](#ai-integration-spring-ai--ollama)).
+- **The model is not provisioned automatically**: `pull-model-strategy=never` and the Compose service has no init step, so on a fresh volume the first call fails until someone runs `ollama pull qwen2.5:3b` by hand.
+- **`ollama/ollama:latest` is unpinned**: unlike `postgres:16-alpine`, the Ollama image floats, so two developers (or two days) can run different server versions. The Ollama service also has no healthcheck, so `docker compose ps` can't say when it is ready.
+- **Ollama runs on CPU in Docker Desktop for macOS**: containers there cannot use the Mac GPU, so the model is slower in `banking-ollama` than in the native Ollama app — which, if installed, also competes for port `11434`.
 - **No authentication/authorization**: every endpoint is unauthenticated and unauthorized — anyone who can reach port 8080 can read all client data and move money between any two accounts.
 - **`spring.jpa.open-in-view` is enabled by default**: Spring logs a warning about this on every startup. It keeps the Hibernate session open for the whole request, which can hide lazy-loading issues and hold DB connections longer than necessary; it's worth setting explicitly to `false`.
 - **The generated OpenAPI spec is incomplete**: springdoc now publishes Swagger UI and an OpenAPI 3.1 document, but it reports `200` for `POST /clients` (actually `201`), describes no error responses, and drops the `@Positive`/`@PositiveOrZero` bounds — see [API Documentation](#api-documentation). Until `@ApiResponse`/`@Operation` annotations are added, the spec cannot be used as the contract on its own.
