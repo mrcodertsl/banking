@@ -57,4 +57,12 @@ public class GlobalExceptionHandler {
         problem.setTitle("Client has a non-zero balance");
         return problem;
     }
+
+    @ExceptionHandler(QueryParsingException.class)
+    public ProblemDetail handleQueryParsing(QueryParsingException ex) {
+        ProblemDetail problem = ProblemDetail.forStatusAndDetail(
+                HttpStatus.SERVICE_UNAVAILABLE, ex.getMessage());
+        problem.setTitle("Search unavailable");
+        return problem;
+    }
 }

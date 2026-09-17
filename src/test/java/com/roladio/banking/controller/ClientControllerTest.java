@@ -1,5 +1,6 @@
 package com.roladio.banking.controller;
 
+import com.roladio.banking.ai.TransactionQueryParser;
 import com.roladio.banking.exceptions.ClientNotFoundException;
 import com.roladio.banking.exceptions.InsufficientFundsException;
 import com.roladio.banking.service.ClientService;
@@ -25,6 +26,8 @@ public class ClientControllerTest {
 
     @MockitoBean
     private ClientService clientService;
+    @MockitoBean
+    private TransactionQueryParser queryParser;
 
     @Test
     void getClientById_whenNotFound_returns404() throws Exception {

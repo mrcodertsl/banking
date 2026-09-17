@@ -9,6 +9,7 @@ import com.roladio.banking.repository.TransactionRepository;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneOffset;
@@ -17,6 +18,10 @@ import java.util.stream.Collectors;
 
 @Service
 public class ClientService {
+
+    private static final BigDecimal MAX_AMOUNT = new BigDecimal("99999999999999999.99");
+    private static final Instant MIN_INSTANT = Instant.EPOCH;
+    private static final Instant MAX_INSTANT = Instant.parse("9999-12-31T23:59:59Z");
 
     private final ClientRepository clientRepository;
     private final TransactionRepository transactionRepository;
@@ -113,27 +118,24 @@ public class ClientService {
     public List<TransactionResponse> searchTransactions(Long id, TransactionFilter filter) {
         findClientById(id);
 
-        Instant fromInstant = toStartOfDay(filter.from());
-        Instant toInstant = toStartOfNextDay(filter.to());
+        BigDecimal minAmount = filter.minAmount() != null ? filter.minAmount() : BigDecimal.ZERO;
+        BigDecimal maxAmount = filter.maxAmount() != null ? filter.maxAmount() : MAX_AMOUNT;
+        Instant fromInstant = filter.from() != null ? toStartOfDay(filter.from()) : MIN_INSTANT;
+        Instant toInstant = filter.to() != null ? toStartOfNextDay(filter.to()) : MAX_INSTANT;
+        Long counterpartyId = filter.counterpartyId() != null ? filter.counterpartyId() : id;
 
-        return transactionRepository.search(
-                        id,
-                        filter.minAmount(),
-                        filter.maxAmount(),
-                        fromInstant,
-                        toInstant,
-                        filter.counterpartyId())
+        return transactionRepository.search(id, minAmount, maxAmount, fromInstant, toInstant, counterpartyId)
                 .stream()
                 .map(this::toTransactionResponse)
                 .collect(Collectors.toList());
     }
 
     private Instant toStartOfDay(LocalDate date) {
-        return date == null ? null : date.atStartOfDay().toInstant(ZoneOffset.UTC);
+        return date.atStartOfDay().toInstant(ZoneOffset.UTC);
     }
 
     private Instant toStartOfNextDay(LocalDate date) {
-        return date == null ? null : date.plusDays(1).atStartOfDay().toInstant(ZoneOffset.UTC);
+        return date.plusDays(1).atStartOfDay().toInstant(ZoneOffset.UTC);
     }
 
     private Client findClientById(Long id) {

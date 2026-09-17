@@ -25,11 +25,11 @@ public interface TransactionRepository extends JpaRepository<Transaction, Long> 
         join fetch t.from
         join fetch t.to
         where (t.from.id = :clientId or t.to.id = :clientId)
-          and (:minAmount is null or t.amount >= :minAmount)
-          and (:maxAmount is null or t.amount <= :maxAmount)
-          and (:fromInstant is null or t.createdAt >= :fromInstant)
-          and (:toInstant is null or t.createdAt < :toInstant)
-          and (:counterpartyId is null or t.from.id = :counterpartyId or t.to.id = :counterpartyId)
+          and t.amount >= :minAmount
+          and t.amount <= :maxAmount
+          and t.createdAt >= :fromInstant
+          and t.createdAt < :toInstant
+          and (t.from.id = :counterpartyId or t.to.id = :counterpartyId)
         order by t.createdAt desc
         """)
     List<Transaction> search(@Param("clientId") Long clientId,

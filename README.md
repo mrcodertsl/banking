@@ -35,7 +35,7 @@ A small Spring Boot REST API for managing bank clients and transferring money be
 | Boilerplate reduction | Lombok |
 | Build tool | Maven, via the included `./mvnw` / `mvnw.cmd` wrapper (Maven 3.9.16, wrapper 3.3.4 — see `.mvn/wrapper/maven-wrapper.properties`) |
 | Test framework | JUnit 5, Mockito 5.14.2, AssertJ, MockMvc / `@WebMvcTest` (`spring-boot-starter-webmvc-test`) |
-| LLM client | Spring AI 2.0.1 (`spring-ai-starter-model-ollama`, versions from the imported `spring-ai-bom`) talking to a local [Ollama](https://ollama.com) server — configured but not yet used by any code; see [AI Integration](#ai-integration-spring-ai--ollama) |
+| LLM client | Spring AI 2.0.1 (`spring-ai-starter-model-ollama`, versions from the imported `spring-ai-bom`) talking to a local [Ollama](https://ollama.com) server running `qwen2.5:7b` — used by `TransactionQueryParser` to turn plain-language search text into a filter; see [AI Integration](#ai-integration-spring-ai--ollama) |
 | Integration testing | Testcontainers 2.0.5 (`spring-boot-testcontainers`, `testcontainers-postgresql`, `testcontainers-junit-jupiter`) — spins up a real PostgreSQL in Docker for the context test |
 
 ## Project Structure
@@ -43,6 +43,8 @@ A small Spring Boot REST API for managing bank clients and transferring money be
 ```
 src/main/java/com/roladio/banking
 ├── BankingApplication.java      # @SpringBootApplication entry point
+├── ai/
+│   └── TransactionQueryParser.java # asks the LLM to turn search text into a TransactionFilter
 ├── config/
 │   └── OpenApiConfig.java       # OpenAPI document metadata (title/description/version)
 ├── controller/
@@ -53,12 +55,13 @@ src/main/java/com/roladio/banking
 │   ├── LastNameRequest.java     # PATCH .../lastName body (no constraints — see API Reference)
 │   ├── PhoneNumberRequest.java  # PATCH .../phoneNumber body
 │   ├── TransferRequest.java     # POST /clients/transfer body
-│   ├── TransactionFilter.java   # optional history search criteria; not bound to any endpoint yet
+│   ├── TransactionFilter.java   # optional history search criteria; produced by the LLM, never bound from HTTP
 │   └── TransactionResponse.java # one entry in GET /clients/{id}/transactions
 ├── exceptions/
 │   ├── ClientNotFoundException.java     # unchecked; carries "Client not found: <id>" -> 404
 │   ├── InsufficientFundsException.java  # unchecked; carries "Insufficient funds" -> 409
 │   ├── ClientHasBalanceException.java   # unchecked; blocks closing a funded account -> 409
+│   ├── QueryParsingException.java       # unchecked; wraps any failure to parse search text -> 503
 │   └── GlobalExceptionHandler.java      # @RestControllerAdvice mapping exceptions -> HTTP status
 ├── model/
 │   ├── Client.java               # JPA entity mapped to the `client` table
@@ -85,7 +88,7 @@ src/test/java/com/roladio/banking
 
 All DTOs are Java `record`s (immutable; request DTOs carry Bean Validation constraints — see [Request validation](#request-validation)). All request/response bodies are plain JSON, there is no API versioning or content negotiation beyond the Spring Boot defaults.
 
-`ClientController` is a thin layer: every method just delegates to `ClientService`. The mutating endpoints (`PATCH`/`PUT`/`DELETE`/`POST /transfer`) are `void` and annotated `@ResponseStatus(HttpStatus.NO_CONTENT)`, so they answer `204`; the `GET` endpoints answer `200` with a `ClientResponse`, a list of them, or — for the history route — a list of `TransactionResponse`, and `POST /clients` builds its own `201` response.
+`ClientController` is a thin layer: every method delegates to `ClientService`, except `searchTransactions`, which first passes the `q` text to `TransactionQueryParser` and then hands the resulting `TransactionFilter` to the service. The mutating endpoints (`PATCH`/`PUT`/`DELETE`/`POST /transfer`) are `void` and annotated `@ResponseStatus(HttpStatus.NO_CONTENT)`, so they answer `204`. The `GET` endpoints answer `200` with a `ClientResponse` or a list of them, or a list of `TransactionResponse` for the history and search routes. `POST /clients` builds its own `201` response.
 
 `ClientService` maps entities to DTOs through two private helpers, `toResponse(Client)` and `toTransactionResponse(Transaction)`, and persists through **JPA dirty checking** rather than explicit saves: every mutating method is `@Transactional` and loads its entity through the repository (`findByIdAndClosedFalse`, or the locking `findByIdForUpdate` in `transfer` — see [Concurrency](#concurrency)), so the entity is managed and Hibernate flushes the changes at commit. Only `createClient` calls `clientRepository.save(...)`, because a brand-new entity has to be made managed first. This means the absence of a `save(...)` call in `updatePhoneNumber`, `updateLastName`, `updateClient`, and `transfer` is deliberate, not an oversight.
 
@@ -230,11 +233,11 @@ public record TransactionResponse(
 >
 > That is roughly 70× on a small table, and the gap widens with volume: the current plan costs a scan of the *whole* table, while the indexed plan costs only the matching rows. The two indexes `V5` created for exactly this lookup are currently never consulted. Restructuring so the predicate lands on the FK columns — for instance selecting the matching ids in a subquery and fetching the associations around it — restores the index scan while keeping the eager fetch.
 
-#### Searching history — `TransactionRepository.search` (not wired up, currently broken)
+#### Searching history — `TransactionRepository.search`
 
-A filtered variant of the history query has been added, but **no endpoint calls it and no test covers it** — and, as shown below, every call to it currently fails.
+A filtered version of the history query. It is exposed through **`GET /clients/{id}/transactions/search`**, where an LLM turns the `q` text into the filter (see [AI Integration](#ai-integration-spring-ai--ollama) and [API Reference](#get-clientsidtransactionssearch)).
 
-The criteria arrive as a new record, `dto/TransactionFilter`, in which every field is optional:
+The criteria come in as `dto/TransactionFilter`, where every field is optional:
 
 ```java
 public record TransactionFilter(
@@ -245,40 +248,33 @@ public record TransactionFilter(
         Long counterpartyId) {}
 ```
 
-`ClientService.searchTransactions(id, filter)` checks the client exists and is open via `findClientById` (unknown or closed → `ClientNotFoundException`, as for plain history), converts the two dates to instants, and passes everything to one JPQL query that makes each filter optional with the `(:param is null or …)` pattern:
+`ClientService.searchTransactions(id, filter)` first checks the client exists and is open with `findClientById` (unknown or closed → `ClientNotFoundException`, as for plain history). It then **replaces every missing criterion with a bound that excludes nothing**, so the query itself never receives a `null`:
+
+| Filter | Meaning | If `null`, replaced by | Why that excludes nothing |
+|---|---|---|---|
+| `minAmount` | `amount >= minAmount` (inclusive) | `BigDecimal.ZERO` | the `amount > 0` check constraint |
+| `maxAmount` | `amount <= maxAmount` (inclusive) | `MAX_AMOUNT` = `99999999999999999.99` | the largest value `NUMERIC(19,2)` can hold |
+| `from` | `createdAt >=` **00:00 UTC** on that date | `MIN_INSTANT` = `Instant.EPOCH` (1970-01-01T00:00Z) | no row can be older |
+| `to` | `createdAt <` **00:00 UTC the day after** that date (the whole day is included) | `MAX_INSTANT` = `9999-12-31T23:59:59Z` | no row can be newer |
+| `counterpartyId` | the other side of the transfer, in either direction | **the client's own `id`** | the client is one side of every row, so the check is always true |
+
+The query then applies every condition unconditionally:
 
 ```java
 where (t.from.id = :clientId or t.to.id = :clientId)
-  and (:minAmount is null or t.amount >= :minAmount)
-  and (:maxAmount is null or t.amount <= :maxAmount)
-  and (:fromInstant is null or t.createdAt >= :fromInstant)
-  and (:toInstant is null or t.createdAt < :toInstant)
-  and (:counterpartyId is null or t.from.id = :counterpartyId or t.to.id = :counterpartyId)
+  and t.amount >= :minAmount
+  and t.amount <= :maxAmount
+  and t.createdAt >= :fromInstant
+  and t.createdAt < :toInstant
+  and (t.from.id = :counterpartyId or t.to.id = :counterpartyId)
 order by t.createdAt desc
 ```
 
-It fetches both parties and orders newest first, exactly like `findHistoryForClient`, and results map through the same `toTransactionResponse`.
+It fetches both parties and sorts newest first, exactly like `findHistoryForClient`, and maps rows through the same `toTransactionResponse`.
 
-| Filter | Meaning | Bound |
-|---|---|---|
-| `minAmount` | `amount >= minAmount` | inclusive |
-| `maxAmount` | `amount <= maxAmount` | inclusive |
-| `from` | `createdAt >=` **00:00 UTC** on that date | inclusive |
-| `to` | `createdAt <` **00:00 UTC the day after** that date | inclusive of the whole day |
-| `counterpartyId` | the other side of the transfer, in either direction | — |
+**This rewrite fixed a bug in the earlier version.** That version made each filter optional with `(:param is null or …)` and failed on PostgreSQL on every call with `could not determine data type of parameter $7`. Hibernate turns `:fromInstant is null` into a bare `? is null`, and PostgreSQL cannot infer a type for an `Instant` parameter used that way. Now every parameter is non-null and appears only next to a column, so it always has a type. Verified through the endpoint against the Compose database: every row count below matched the equivalent hand-written SQL.
 
-> ⚠️ **Every call fails on PostgreSQL** — with no filters, with all filters, and anything in between:
->
-> ```
-> InvalidDataAccessResourceUsageException:
->   ERROR: could not determine data type of parameter $7
-> ```
->
-> Hibernate expands each named parameter into a separate positional one, so `:fromInstant is null` becomes a bare `? is null`. Parameter `$7` is that first `Instant` occurrence: the driver sends it without a declared type (whether its value is null or not), and a bare `? is null` gives PostgreSQL nothing to infer one from, so the statement is rejected when it is prepared. The `BigDecimal` and `Long` parameters in the same positions do not have this problem. Verified against the Testcontainers PostgreSQL.
->
-> Only the two date checks need to change. Writing them as `cast(:fromInstant as Instant) is null` and `cast(:toInstant as Instant) is null` makes the query run, and gives the results below.
-
-Behavior with that one change applied, on the `V6` seed data for client 1 (68 rows), matched against equivalent hand-written SQL:
+The new form returns the same rows as the earlier one would have with the date checks cast. These counts were measured on a fresh `V6` database for client 1 (68 rows):
 
 | Filter | Rows |
 |---|---|
@@ -294,13 +290,14 @@ Behavior with that one change applied, on the `V6` seed data for client 1 (68 ro
 | `from` later than `to` | 0 — no error |
 | `minAmount = 100`, `maxAmount = 1000`, last 90 days, `counterpartyId = 3` | 7 |
 
-Three behaviors are worth knowing before this reaches an endpoint:
+Worth knowing:
 
-- **A client named as its own counterparty disables the filter.** The client is always one side of every row, so `t.from.id = :counterpartyId or t.to.id = :counterpartyId` is true for all of them. The answer is the unfiltered history rather than an empty list.
-- **Dates are UTC calendar days.** `LocalDate` is turned into an instant with `ZoneOffset.UTC`, not the caller's or the server's zone. Verified: a transfer made at `2026-01-11 00:30` in UTC+2 is `2026-01-10 22:30` UTC, so it is returned for `from = to = 2026-01-10` and not for `2026-01-11`.
-- **`filter` itself must not be `null`.** `searchTransactions` calls `filter.from()` straight away, so a `null` filter throws `NullPointerException`; "no filters" means a `TransactionFilter` with all fields `null`.
+- **Naming the client as its own counterparty turns that filter off.** This is now built into the code: a `null` `counterpartyId` is replaced by the client's own id, so "no counterparty" and "the client itself" run the same query and both return the full history.
+- **Dates are UTC calendar days.** `LocalDate` is turned into an instant with `ZoneOffset.UTC`, not the caller's or the server's zone. Verified: a transfer made at `2026-01-11 00:30` in UTC+2 is `2026-01-10 22:30` UTC, so it is returned for `from = to = 2026-01-10` and not for `2026-01-11`. The parser, by contrast, tells the model "today" in the server's zone (see [AI Integration](#ai-integration-spring-ai--ollama)).
+- **`filter` itself must not be `null`.** `searchTransactions` calls `filter.minAmount()` immediately, so a `null` filter throws `NullPointerException`. "No filters" means a `TransactionFilter` with all fields `null`, which is what the parser produces for `q=everything`.
+- **`MIN_INSTANT` quietly drops anything before 1970.** No transaction can be that old today, but the bound is a real filter, not a true "no limit".
 
-`TransactionFilter` carries no validation annotations (no `@Positive` on the amounts, and no check that `from` is not after `to`), and its `LocalDate` fields have no `@DateTimeFormat`. How it will bind from query parameters depends on the endpoint that eventually exposes it.
+`TransactionFilter` has no validation annotations (no `@Positive` on the amounts, and no check that `from` is not after `to`). It is not bound from HTTP at all: it is whatever the model returns, so these checks could only happen after parsing.
 
 > ⚠️ **`createdAt` is `null` on a freshly persisted instance.** Because the column is `insertable = false`, Hibernate omits it from the `INSERT` and does not read it back, so the value exists in the database but not on the object in memory. Verified against a real database: after `persist` + `flush` the entity has its generated `id` but `createdAt == null`; only after a refresh or reload does it populate.
 >
@@ -409,7 +406,7 @@ spring.datasource.password=${DB_PASSWORD:postgres}
 spring.jpa.hibernate.ddl-auto=validate
 
 spring.ai.ollama.base-url=${OLLAMA_URL:http://localhost:11434}
-spring.ai.ollama.chat.model=qwen2.5:3b
+spring.ai.ollama.chat.model=qwen2.5:7b
 spring.ai.ollama.chat.options.temperature=0.0
 spring.ai.ollama.init.pull-model-strategy=never
 ```
@@ -454,33 +451,74 @@ There is no `application-test.properties` or `test` profile. `BankingApplication
 
 ## AI Integration (Spring AI + Ollama)
 
-The project now has an LLM client wired in, but **nothing in the application uses it yet**: no controller, service or test injects a `ChatModel` or `ChatClient`. What exists is the dependency, its configuration, and an Ollama server in Docker Compose.
+The LLM client is now used by one feature: **plain-language transaction search**. `GET /clients/{id}/transactions/search?q=…` sends the `q` text to a local Ollama model, which turns it into a `TransactionFilter`, and then runs the regular database search (see [Searching history](#searching-history--transactionrepositorysearch)). The model **only builds the filter**. It never sees transaction data, and the database query decides which rows come back.
 
-**Dependency.** `pom.xml` adds `spring-ai-starter-model-ollama` without a version, and imports `org.springframework.ai:spring-ai-bom:2.0.1` in a new `<dependencyManagement>` block to supply it. The starter brings in the Ollama client plus Spring AI's chat-client, chat-memory, tool-calling, retry and observation auto-configuration.
+**Dependency.** `pom.xml` adds `spring-ai-starter-model-ollama` without a version, and imports `org.springframework.ai:spring-ai-bom:2.0.1` in a `<dependencyManagement>` block to supply it. The starter brings in the Ollama client plus Spring AI's chat-client, chat-memory, tool-calling, retry and observation auto-configuration.
 
-**Beans created at startup.** Because of that auto-configuration, every application context — including the test contexts — now contains, among others:
+**Beans created at startup.** Because of that auto-configuration, every application context (the test contexts too) contains, among others:
 
 | Bean | Type |
 |---|---|
 | `ollamaApi` | `OllamaApi` — the HTTP client for `spring.ai.ollama.base-url` |
 | `ollamaChatModel` | `OllamaChatModel` — the injectable `ChatModel` |
-| `chatClientBuilder` | `ChatClient.Builder` — the fluent API most code would start from |
+| `chatClientBuilder` | `ChatClient.Builder` — injected into `TransactionQueryParser` |
 | `ollamaEmbeddingModel` | `OllamaEmbeddingModel` — created too, though no embedding model is configured |
-| `chatMemory` | `MessageWindowChatMemory` over an `InMemoryChatMemoryRepository` |
-| `toolCallingManager` | `DefaultToolCallingManager` |
+| `chatMemory` | `MessageWindowChatMemory` over an `InMemoryChatMemoryRepository` — unused |
+| `toolCallingManager` | `DefaultToolCallingManager` — unused |
 
-Creating these beans makes **no network call**, so the application starts, and all 25 tests pass, with no Ollama server running. Verified by running the full suite with `OLLAMA_URL` pointed at a closed port. CI therefore needs no changes.
+Creating these beans, and building the parser's `ChatClient`, makes **no network call**. The application therefore starts without an Ollama server; only a search request needs one. Verified by starting the app with `OLLAMA_URL` pointed at a closed port. No test calls the model (the controller slice mocks the parser), so the suite and CI still need no Ollama.
+
+### `TransactionQueryParser` (`ai/TransactionQueryParser.java`)
+
+A `@Component` that builds one `ChatClient` from the auto-configured `ChatClient.Builder`. `parse(query)` makes a single call:
+
+```java
+chatClient.prompt()
+        .system(SYSTEM_PROMPT.formatted(LocalDate.now()))
+        .user(query)
+        .call()
+        .entity(TransactionFilter.class);
+```
+
+- **System prompt.** It says "Today is <date>", tells the model to fill in only the fields the user explicitly asked for and leave the rest `null` (and never set a date range unless time was mentioned), and asks for ISO `yyyy-MM-dd` dates. It also gives six examples: `transfers over 1000`, `small payments under 50`, `transfers in the last week`, `big transfers last month` (which defines "big" as `minAmount 1000`), `transfers with client 3` and `everything`.
+- **Structured output.** `.entity(TransactionFilter.class)` uses Spring AI's structured-output support. It adds instructions to the prompt, including a JSON schema generated from the record, and reads the model's JSON reply into a `TransactionFilter` with Jackson.
+- **Logging.** On success it logs `Parsed query [<q>] into TransactionFilter[…]` at `INFO`. On any exception it logs `Could not parse query [<q>]` at `WARN` with the stack trace, then throws `QueryParsingException` ("Could not interpret the search query"). `GlobalExceptionHandler` maps that to **`503 Search unavailable`**. The raw search text is written to the log either way.
+- **`try` covers everything.** Ollama being unreachable, the model returning something that isn't valid JSON, and invalid input (such as an empty `q`) are all reported the same way, as `503`.
+
+**Measured behavior.** Run on 2026-09-17 against `qwen2.5:7b` in the Compose container (Docker Desktop on macOS, CPU only), for client 1 with 69 history rows. The *Parsed filter* column is the parser's own log line, and every row count matched hand-written SQL for that filter:
+
+| `q` | Parsed filter (non-null fields) | Rows | Time | Right? |
+|---|---|---|---|---|
+| `everything` | *(none)* | 69 | 29.1 s — first call, model loading | ✅ |
+| `transfers over 1000` | `minAmount=1000` | 9 | 13.3 s | ✅ |
+| `small payments under 50` | `maxAmount=50` | 14 | 11.8 s | ✅ |
+| `transfers with client 2` | `counterpartyId=2` | 35 | 11.6 s | ✅ |
+| `transfers in the last week` | `from=2026-09-10`, `to=2026-09-17` | 5 | 16.8 s | ✅ |
+| `big transfers last month` | `minAmount=1000`, `from=2026-08-01`, `to=2026-08-31` | 1 | 16.0 s | ✅ (by the prompt's own definition of "big") |
+| `transfers between 100 and 500` | `minAmount=100`, `maxAmount=500`, **`from=2026-09-17`** | 1 | 14.7 s | ❌ date made up by the model; 16 without it |
+| `transfers with Jane` | **`from=to=2026-09-17`, `counterpartyId=3`** | 1 | 15.4 s | ❌ Jane Roe is client 2 (35 rows); the model guessed an id and a date |
+| `hello` | `from=2026-09-10`, `to=2026-09-17` | 5 | 14.9 s | ❌ nonsense returned last week's history instead of an error |
+| *(empty)* | — | `503` | 0.05 s | `ChatClient.user("")` throws `IllegalArgumentException: text cannot be null or empty` |
+
+What the table shows:
+
+- **A 200 response doesn't mean the query was understood.** Even at temperature `0.0` and with the prompt's "MUST be null" rule, the model sometimes adds filters that nobody asked for. The response doesn't say which filter was applied, so the caller can't tell. Only the server log shows it.
+- **Clients can only be named by id.** The model has no access to client names, so "Jane" became a made-up `counterpartyId`. That returned the wrong person's transfers rather than an error.
+- **Each search takes roughly 12–17 s** on CPU once the model is loaded, and one Tomcat thread is busy for that whole time.
+- **The model is called before the client lookup.** A search for an unknown id (`999`) waited 6.7 s for the model and then returned `404`. A search for an unknown id while Ollama is down fails the way described below, not with a `404`.
+- **"Today" and the date filters use different time zones.** The prompt uses `LocalDate.now()` in the JVM's zone (UTC+2 in the run above), while `searchTransactions` reads the dates as UTC days. Near midnight, "today" can be a different day from the one the filter applies.
+- **Prompt injection can't reach other clients' data.** The model's output only fills in a `TransactionFilter`, and the query always keeps `t.from.id = :clientId or t.to.id = :clientId` from the path. The worst a crafted `q` can do is choose a filter for that client's own history. What limits access is the SQL, not the prompt. (There is still no authentication at all; see [Known Issues](#known-issues--limitations).)
 
 **Configuration.**
 
 | Property | Value | Effect |
 |---|---|---|
 | `spring.ai.ollama.base-url` | `${OLLAMA_URL:http://localhost:11434}` | Where Ollama is reached. The fallback is Spring AI's own default; the line exists to allow the `OLLAMA_URL` override. |
-| `spring.ai.ollama.chat.model` | `qwen2.5:3b` | Qwen 2.5, 3.1B parameters, `Q4_K_M` quantization, about 1.9 GB on disk, 32k context. |
-| `spring.ai.ollama.chat.options.temperature` | `0.0` | Always pick the most likely token, so the same prompt gives (near-)identical output — suited to extraction or classification rather than creative text. |
+| `spring.ai.ollama.chat.model` | `qwen2.5:7b` | Qwen 2.5, 7.6B parameters, `Q4_K_M` quantization, about 4.7 GB on disk, 32k context. Upgraded from `qwen2.5:3b` (3.1B, ~1.9 GB) together with the search feature. |
+| `spring.ai.ollama.chat.options.temperature` | `0.0` | The model always picks the most likely token, so the same prompt gives (nearly) the same output. That suits extracting a filter, but as shown above it doesn't prevent wrong answers. |
 | `spring.ai.ollama.init.pull-model-strategy` | `never` | The app never downloads the model itself; it must already be present in Ollama. `never` is also Spring AI's default, so this line only makes the choice explicit. |
 
-**Ollama in Docker Compose.** `docker-compose.yml` gains a second service:
+**Ollama in Docker Compose.** `docker-compose.yml` has a second service:
 
 | Setting | Value |
 |---|---|
@@ -490,17 +528,17 @@ Creating these beans makes **no network call**, so the application starts, and a
 | Data volume | named volume `ollama-data` at `/root/.ollama`, so pulled models survive `down` but not `down -v` |
 | Healthcheck | none |
 
-**Getting a working model.** With `pull-model-strategy=never`, starting the container is not enough — the model has to be pulled once:
+**Getting a working model.** With `pull-model-strategy=never`, starting the container isn't enough. The model has to be pulled once:
 
 ```bash
 docker compose up -d ollama
-docker exec banking-ollama ollama pull qwen2.5:3b     # ~1.9 GB, once per volume
-curl http://localhost:11434/api/tags                  # should list qwen2.5:3b
+docker exec banking-ollama ollama pull qwen2.5:7b     # ~4.7 GB, once per volume
+curl http://localhost:11434/api/tags                  # should list qwen2.5:7b
 ```
 
-Verified end-to-end against that container: a `ChatClient` call with the prompt "Reply with exactly the word OK." returned `OK` — 4.7 s on the first call while the model loaded into memory, 187 ms on the next.
+A volume that only has the earlier `qwen2.5:3b` doesn't satisfy the new setting. Pull `qwen2.5:7b` as well (`ollama rm qwen2.5:3b` frees ~1.9 GB), or set `spring.ai.ollama.chat.model` back to `qwen2.5:3b`.
 
-> ⚠️ **A call to an unreachable Ollama blocks for about 19 minutes before failing.** Spring AI's retry defaults apply to every model call: `spring.ai.retry.max-attempts=10`, an initial back-off of 2 s multiplied by 5 each time, capped at 3 minutes. Observed against a closed port: retries after 2 s, 10 s, 50 s, then every 180 s. Nine waits add up to roughly 1,140 s on the calling thread — in a web request, far longer than any client will wait. Lowering `spring.ai.retry.max-attempts` and `spring.ai.retry.backoff.max-interval` before building a feature on it is advisable.
+> ⚠️ **A call to an unreachable Ollama blocks for about 19 minutes before failing, and this now happens inside an HTTP request.** Spring AI's retry defaults apply to every model call: `spring.ai.retry.max-attempts=10`, an initial back-off of 2 s multiplied by 5 each time, capped at 3 minutes. That is nine waits, roughly 1,140 s, before `QueryParsingException` turns the failure into a `503`. Checked with `GET /clients/1/transactions/search?q=everything` on an instance with `OLLAMA_URL` pointed at a closed port: the log showed `Retry error. Retry count:1`, `2` and `3` at +2 s, +12 s and +62 s, and the HTTP client gave up at 75 s without receiving any response. The server thread keeps retrying after the client disconnects. Lowering `spring.ai.retry.max-attempts` and `spring.ai.retry.backoff.max-interval` would bring this down to a few seconds.
 
 ## Running the App
 
@@ -510,7 +548,7 @@ Verified end-to-end against that container: a `ChatClient` call with the prompt 
 - A PostgreSQL server with a `banking` database, reachable with the settings in [Configuration](#configuration) (defaults: `localhost:5432`, user `postgres`, password `postgres`). The bundled Docker Compose file provides exactly that — see below.
 - No global Maven install required — use the bundled wrapper
 - Docker is needed for the Compose database and for the tests (see [Testing](#testing)), but not to run the app itself against an existing PostgreSQL
-- Ollama is **not** required: the app starts without it, and nothing calls it yet (see [AI Integration](#ai-integration-spring-ai--ollama))
+- Ollama with `qwen2.5:7b` pulled is needed **only for `GET /clients/{id}/transactions/search`**. The app starts without it, and every other endpoint works without it (see [AI Integration](#ai-integration-spring-ai--ollama))
 
 ### Starting PostgreSQL with Docker Compose
 
@@ -535,7 +573,7 @@ docker compose down -v        # stop it and delete the data volume
 
 Its environment matches the defaults in `application.properties` exactly, so with Compose running you need no `DB_*` variables at all — `./mvnw spring-boot:run` connects as-is.
 
-A plain `docker compose up -d` now also starts `banking-ollama`, which downloads the ~2.8 GB `ollama/ollama` image on first use. Since nothing calls it yet, `docker compose up -d postgres` is enough to run the app. See [AI Integration](#ai-integration-spring-ai--ollama) for the Ollama service.
+A plain `docker compose up -d` also starts `banking-ollama`, which downloads the ~2.8 GB `ollama/ollama` image on first use. It is only used by the search endpoint, so `docker compose up -d postgres` is enough for everything else. For search, the model also has to be pulled into the container once. See [AI Integration](#ai-integration-spring-ai--ollama).
 
 > **Port conflict:** the file publishes host port `5432`. If you already run PostgreSQL locally on that port, `docker compose up` fails with "port is already allocated". Either stop the local server, or publish a different host port (e.g. `"55432:5432"`) and start the app with `DB_PORT=55432`. The same applies to Ollama on `11434` — commonly already taken by the native Ollama desktop app — using e.g. `"11435:11434"` and `OLLAMA_URL=http://localhost:11435`.
 
@@ -581,12 +619,12 @@ public OpenAPI bankingOpenAPI() {
 }
 ```
 
-The emitted document is **OpenAPI 3.1.0** and covers all nine operations and all six DTO schemas (`TransactionResponse` included — its `type` is rendered as a string enum `["TRANSFER"]` and `createdAt` as `date-time`). `/swagger-ui.html` is a convenience path — it answers `302` and redirects to `/swagger-ui/index.html`, which is where the UI is actually served.
+The emitted document is **OpenAPI 3.1.0** and covers all ten operations and all six DTO schemas (`TransactionResponse` included — its `type` is rendered as a string enum `["TRANSFER"]` and `createdAt` as `date-time`). `/swagger-ui.html` is a convenience path — it answers `302` and redirects to `/swagger-ui/index.html`, which is where the UI is actually served.
 
 > ⚠️ **The generated spec is an explorer, not the full contract.** Three things it does not capture, so this README remains authoritative:
 >
 > - **`POST /clients` is documented as `200`, but really returns `201`.** The status is built at runtime by `ResponseEntity.created(...)`, which springdoc cannot infer statically. The four `@ResponseStatus(NO_CONTENT)` endpoints *are* reported correctly as `204`.
-> - **No error responses are described at all** — none of the `400`, `404` or `409` outcomes (including the `404` from the history route), nor the RFC 7807 body they carry (see [Error Handling](#error-handling)).
+> - **No error responses are described at all** — none of the `400`, `404`, `409` or `503` outcomes (including the `404` from the history routes and the `503` from search), nor the RFC 7807 body they carry (see [Error Handling](#error-handling)). The search operation is listed with only its required `q` string parameter and a `200` array of `TransactionResponse`; nothing says the text is interpreted by an LLM or how long a call can take.
 > - **Only some constraints survive.** `@NotBlank`/`@NotNull` become `required` plus `minLength: 1`, but `@Positive` and `@PositiveOrZero` produce no `minimum` — `balance` and `amount` appear as a bare `number`, so the spec does not say they must be non-negative.
 >
 > Adding `@ApiResponse`/`@Operation` annotations to `ClientController` would close all three.
@@ -607,6 +645,7 @@ Base path: `/clients`. No authentication, no pagination, no content negotiation 
 | `PUT /clients/{id}` | `204` | `400`, `404` |
 | `DELETE /clients/{id}` | `204` | `404`, `409` |
 | `GET /clients/{id}/transactions` | `200` + array | `404` |
+| `GET /clients/{id}/transactions/search?q=…` | `200` + array | `400`, `404`, `503` |
 | `POST /clients/transfer` | `204` | `400`, `404`, `409` |
 
 Mutating endpoints return `204 No Content` with no body, so a client that needs the updated state must issue a follow-up `GET`. `POST /clients` is the exception: it returns the created representation.
@@ -836,6 +875,43 @@ A client with no transfers gets `200` with `[]`.
 
 The list is unpaged — every row for the client comes back in one response (see [Known Issues](#known-issues--limitations)).
 
+### `GET /clients/{id}/transactions/search`
+
+Searches the client's history with a plain-language query. An LLM turns `q` into amount, date and counterparty filters (see [AI Integration](#ai-integration-spring-ai--ollama)), and the matching transfers are returned newest first. The rows have the same shape as `GET /clients/{id}/transactions`.
+
+```bash
+curl -G http://localhost:8080/clients/1/transactions/search \
+  --data-urlencode "q=transfers over 1000"
+```
+
+**Response — `200 OK`** with an array of `TransactionResponse` (9 entries for client 1 on the database used in [AI Integration](#ai-integration-spring-ai--ollama)). `q=everything` returns the same list as the plain history route.
+
+| Parameter | In | Required | Notes |
+|---|---|---|---|
+| `id` | path | yes | Must be an existing, open client. |
+| `q` | query | yes | Free text. The model understands amounts ("over 1000", "under 50"), time ranges ("last week", "last month") and counterparties **by id only** ("with client 2"). |
+
+The model can only fill in these five filters:
+
+| Filter | Applied as |
+|---|---|
+| `minAmount` / `maxAmount` | inclusive bounds on `amount` |
+| `from` / `to` | whole UTC calendar days, both inclusive |
+| `counterpartyId` | the other side of the transfer, in either direction |
+
+The response doesn't include the filter that was used, so a caller can't check how the query was understood. The model sometimes adds filters that weren't asked for, and it answers meaningless text with a filter rather than an error (examples in [AI Integration](#ai-integration-spring-ai--ollama)).
+
+Expect **10–30 s per request** with the Compose container on a CPU. The first call after Ollama starts is the slowest, because the model has to load.
+
+**Errors**
+
+| Condition | Status | Body |
+|---|---|---|
+| `q` missing | `400 Bad Request` | Spring Boot's default error JSON, `{"timestamp":…,"status":400,"error":"Bad Request","path":…}`, served as `application/json`, **not** a problem document |
+| `q` present but empty (`?q=`) | `503 Service Unavailable` | title `Search unavailable`, detail `Could not interpret the search query` — a client mistake reported as an outage |
+| Ollama unreachable, or the model's reply can't be parsed | `503 Service Unavailable` | same body; when Ollama is unreachable it arrives only after ~19 minutes of retries |
+| Client unknown or closed | `404 Not Found` | title `Client not found`; returned only **after** the model call has finished |
+
 ### `POST /clients/transfer`
 
 Moves `amount` from `fromId`'s balance to `toId`'s balance. Returns `204 No Content` on success.
@@ -878,6 +954,7 @@ The whole transfer runs inside a single `@Transactional` service method, so if `
 | `ClientNotFoundException` | `404 Not Found` | `Client not found` | `Client not found: <id>` |
 | `InsufficientFundsException` | `409 Conflict` | `Insufficient funds` | `Insufficient funds` |
 | `ClientHasBalanceException` | `409 Conflict` | `Client has a non-zero balance` | `Cannot close client with a non-zero balance: <id>` |
+| `QueryParsingException` | `503 Service Unavailable` | `Search unavailable` | `Could not interpret the search query` |
 | `IllegalArgumentException` | `400 Bad Request` | `Invalid request` | *(exception message)* |
 | `MethodArgumentNotValidException` | `400 Bad Request` | `Validation error` | `Request validation failed` |
 
@@ -894,9 +971,11 @@ A representative body — Spring fills `instance` in with the request URI automa
 
 All four share one envelope, so a client can parse errors generically. The validation handler is the only one that adds an extension member: it collects `getBindingResult().getFieldErrors()` into a `LinkedHashMap` (preserving field order) and attaches it via `setProperty("errors", …)`, producing the nested `errors` object shown under [Request validation](#request-validation).
 
-Both custom exceptions are unchecked (`RuntimeException`) and build their own message in the constructor, so the throw sites read as `new ClientNotFoundException(id)` / `new InsufficientFundsException()`.
+All custom exceptions are unchecked (`RuntimeException`) and build their own message in the constructor, so the throw sites read as `new ClientNotFoundException(id)` / `new InsufficientFundsException()`. `QueryParsingException` also keeps the underlying error as its `cause`. That error is logged, but the response body carries only the fixed detail, so no model or connection error details reach the caller.
 
 Any other unhandled exception (e.g. a database connectivity failure, a malformed JSON body, or a `DataIntegrityViolationException` from exceeding a column's length) falls through to Spring Boot's default error handling. Those responses are *also* `application/problem+json`, but carry Spring's generic title/detail rather than a domain-specific one.
+
+One exception to that has been observed: calling `GET /clients/{id}/transactions/search` without `q` returns `400` with Spring Boot's older error body (`timestamp`, `status`, `error`, `path`) as plain `application/json`. So a missing query parameter doesn't produce the same envelope as the other errors.
 
 ## Concurrency
 
@@ -956,7 +1035,9 @@ Current state: **25 tests, all passing** (15 unit, 4 controller-slice, 5 integra
 | `BankingApplicationTests` | Integration (`@SpringBootTest` + `@Testcontainers`) | `contextLoads()` — boots the full application context against a disposable PostgreSQL container. Because startup runs Flyway and then `ddl-auto=validate`, this single test transitively proves that **V1→V6 apply cleanly to an empty database** and that the resulting schema **matches the `Client` entity**. |
 | `service.ClientServiceTest` | Unit (Mockito-mocked `ClientRepository`, no DB) | `getAllClients` (mapping, size); `getClientById` plus its `ClientNotFoundException` path; `updatePhoneNumber`; `updateLastName`; `updateClient`; `createClient` (returns the saved client's id and mapped fields); `transfer` — happy path, same-account and insufficient-funds cases, and `transfer_savesTransactionRecord`, which verifies a `Transaction` is passed to `transactionRepository.save(...)`; `closeClient` with a zero and a non-zero balance. Balance assertions use AssertJ's `isEqualByComparingTo` (scale-independent `BigDecimal` comparison) rather than `isEqualTo`. |
 | `service.ClientServiceIntegrationTest` | Integration (`@SpringBootTest` + `@Testcontainers`) | Drives the real `ClientService` against a real database: a transfer moves money and **both balances survive the commit**; a failed transfer (insufficient funds) **leaves both balances unchanged**, proving the rollback; closing a client (after draining its balance) **removes it from the listing and makes it read as not-found**; a transfer `1 → 2` **appears at the top of client 1's history** with the right ids, amount, a non-null `createdAt` and a resolved `fromName`, and shows up in client 2's history too; and `getClientHistory` for an unknown id throws `ClientNotFoundException`. |
-| `controller.ClientControllerTest` | Web slice (`@WebMvcTest(ClientController.class)` + `@MockitoBean` service) | Exercises the HTTP layer with MockMvc and no database: `404` + problem-document `status`/`detail` for an unknown id; `400` with `errors.amount` for a negative amount; `400` with `errors.{fromId,toId,amount}` for an empty body; `409` when the service reports insufficient funds. |
+| `controller.ClientControllerTest` | Web slice (`@WebMvcTest(ClientController.class)` + `@MockitoBean` service and query parser) | Exercises the HTTP layer with MockMvc and no database: `404` + problem-document `status`/`detail` for an unknown id; `400` with `errors.amount` for a negative amount; `400` with `errors.{fromId,toId,amount}` for an empty body; `409` when the service reports insufficient funds. |
+
+`ClientControllerTest` now also declares `@MockitoBean TransactionQueryParser`. `@WebMvcTest` doesn't pick up `@Component` classes, and the controller's constructor now needs the parser, so the slice can't create the controller without that mock. No test gives the mock any behavior yet.
 
 Test methods follow a `method_whenCondition_expectedBehavior` naming convention (e.g. `transfer_whenInsufficientFunds_throwsInsufficientFunds`).
 
@@ -991,7 +1072,7 @@ class BankingApplicationTests {
 
 **Remaining gaps**
 
-- **`TransactionRepository.search` / `ClientService.searchTransactions` have no tests at all** — which is how a query that fails on every call went unnoticed while the suite stays green. A single integration test calling it with an empty `TransactionFilter` would have caught it.
+- **The search feature has no tests at any layer.** Nothing covers `TransactionRepository.search`, the default bounds in `ClientService.searchTransactions`, `TransactionQueryParser`, the `GET /clients/{id}/transactions/search` mapping, or the `503` from `QueryParsingException`. The earlier version of the query failed on every call without the suite noticing; this rewrite works only because it was checked by hand. An integration test calling `searchTransactions` with an all-`null` `TransactionFilter` and one test per filter would protect the query. A `@WebMvcTest` that stubs the parser would cover the HTTP contract without needing Ollama.
 - **`GET /clients/{id}/transactions` has no controller-slice test.** The service method is covered by integration tests, but nothing asserts the HTTP mapping — the `200` array shape or the `404` problem document.
 - **The history tests are shallow in places.** `transfer_savesTransactionRecord` matches `any(Transaction.class)`, so it would pass if the wrong parties, amount or type were recorded; the integration test's two `isNotEmpty()` checks on the histories of clients 1 and 2 are now **always true before the transfer even happens**, because `V6` seeds both — so they no longer prove anything, and only the `getFirst()` assertions on client 1's history test the new row; and there is no unit test for `getClientHistory` or for the `TransactionResponse` mapping (including the `null` last-name case). The integration test's `getFirst()` check is reliable despite the shared database only because the test's own transfer is the most recent one.
 - **No test covers history for a closed client** — neither the `404` on its own history nor its transfers remaining visible to a counterparty.
@@ -1050,25 +1131,29 @@ Two details make this work without extra setup:
 - **`ClientRequest` serves two endpoints with different semantics**: `balance` seeds the opening balance on `POST /clients`, but is required-and-ignored on `PUT /clients/{id}` (see [API Reference](#put-clientsid)). Splitting it into `CreateClientRequest` / `UpdateClientRequest` would make both contracts honest.
 - **`updateClient_updatesAllFields` is now misnamed**: it no longer asserts anything about balance, because the endpoint no longer changes it — the name promises more than the test checks.
 - **`createClient`'s test doesn't verify the saved entity**: it stubs `repository.save(any(Client.class))` and only checks the returned `ClientResponse`, so a bug that dropped a field before calling `save` (e.g. forgetting to copy `phoneNumber`) wouldn't be caught. `POST /clients` also has no controller-slice or integration coverage, so its `201` and `Location` header are untested (see [Testing](#testing)).
-- **History search fails on every call**: `TransactionRepository.search` is rejected by PostgreSQL with `could not determine data type of parameter $7`, because the `:fromInstant is null` / `:toInstant is null` checks give the database no type for an `Instant` parameter. Nothing calls it yet, so the application runs normally — it becomes a `500` as soon as an endpoint does. Casting both checks (`cast(:fromInstant as Instant) is null`) makes it run (see [Data Model](#searching-history--transactionrepositorysearch-not-wired-up-currently-broken)).
-- **History search has edge cases to settle before it is exposed**: naming the client as its own `counterpartyId` returns the full history rather than nothing; date filters use UTC calendar days regardless of the caller's zone; inverted amount or date ranges silently return `[]`; a `null` filter throws `NullPointerException`; and `TransactionFilter` has no validation.
-- **Two queries overlap**: `search` with no filters returns exactly what `findHistoryForClient` does, so the history endpoint could be served by `search` and the older query removed, once `search` works.
+- **Search results can be silently wrong**: `GET /clients/{id}/transactions/search` trusts whatever filter the model returns. In testing, the model added a date nobody asked for ("transfers between 100 and 500" → 1 row instead of 16), mapped a name to the wrong client id ("with Jane" → client 3's transfers), and answered "hello" with last week's history. Every one of those was a `200`, and the response doesn't include the filter that was applied (see [AI Integration](#ai-integration-spring-ai--ollama)). Returning the parsed filter with the results, or checking it against the query, would make these mistakes visible.
+- **Search can't understand client names**: the model has no access to client data, so "transfers with Jane" can only become a guessed `counterpartyId`. Only "with client 2" style queries work reliably.
+- **Search is slow and costly per request**: each call spends about 12–17 s of CPU on a 7.6B model (29 s on the first call), holding a request thread the whole time. There is no timeout, caching, rate limit or authentication in front of it, so nothing limits how many of these requests run at once.
+- **Search status codes are misleading at the edges**: an empty `q` returns `503 Search unavailable` although it is a client error; a missing `q` returns `400` in Spring Boot's default body rather than a problem document; and because the model is called before the client lookup, an unknown id takes seconds to get its `404`, and gets `503` instead if Ollama is down.
+- **Search edge cases remain**: naming the client as its own `counterpartyId` returns the full history rather than nothing (and is exactly how a missing counterparty is implemented); date filters use UTC calendar days while the prompt's "today" uses the server's zone; inverted amount or date ranges silently return `[]`; a `null` filter throws `NullPointerException`; and `TransactionFilter` has no validation.
+- **Raw search text is logged**: every query is written at `INFO` (and at `WARN` with a stack trace on failure). The text is whatever the user typed, which may include personal details.
+- **Two queries overlap**: `search` with an all-`null` filter returns exactly what `findHistoryForClient` does, so the history endpoint could be served by `search` and the older query removed.
 - **A closed client's history is unreachable**: `GET /clients/{id}/transactions` resolves the client through the closed-filtering lookup, so once an account is closed its own statement answers `404`, even though every row survives in the `transaction` table. Its transfers stay visible only from the counterparty's side.
 - **History entries carry no direction**: the response has no in/out indicator or signed amount, so a consumer has to compare `fromId` with the requested id to know whether money arrived or left.
 - **`fromName`/`toName` render as `"Cher null"` when a client has no last name**: `TransactionResponse` builds the display name with `getFirstName() + " " + getLastName()`, and `last_name` is nullable with no `@NotBlank` on `ClientRequest.lastName` — so a client created without one is reachable through the public API and its name renders with a literal `null`. Verified end-to-end through `GET /clients/{id}/transactions`.
-- **`findHistoryForClient` bypasses the `V5` indexes**: filtering on the fetch-joined aliases makes PostgreSQL scan the whole `transaction` table instead of using `idx_transaction_from_id`/`idx_transaction_to_id` — measured at ~70× slower on 40k rows, degrading further as volume grows. Now that `GET /clients/{id}/transactions` calls it, this is on a live, public path (see [Data Model](#reading-history--transactionrepository)). The new `search` query filters on the same aliases (Hibernate renders `f1_0.id=? or t2_0.id=?`), so it inherits the problem, and its optional-filter pattern makes a well-indexed plan harder still.
+- **`findHistoryForClient` bypasses the `V5` indexes**: filtering on the fetch-joined aliases makes PostgreSQL scan the whole `transaction` table instead of using `idx_transaction_from_id`/`idx_transaction_to_id` — measured at ~70× slower on 40k rows, degrading further as volume grows. Now that `GET /clients/{id}/transactions` calls it, this is on a live, public path (see [Data Model](#reading-history--transactionrepository)). The `search` query filters on the same aliases, so it has the same problem. It also always adds a second `from.id = ? or to.id = ?` check for the counterparty, even when that check is just the client's own id and matches every row.
 - **Seeded history contradicts seeded balances**: `V6` inserts 100 transfers without adjusting any balance, so a client's history does not sum to its balance, and replayed in order it would drive clients 2 and 3 negative — something the application forbids (see [Seed transactions](#seed-transactions-v6)). Anything that reconciles balances against the ledger will report every seeded client as wrong.
 - **Sample data ships in versioned migrations**: `V2`, `V3` and now `V6` are ordinary Flyway migrations, so any database this application is pointed at — including a production one — receives four fake clients and 100 fake transfers between them. Moving seed scripts to a separate location enabled only for local profiles (e.g. `spring.flyway.locations` per profile) would keep them out.
 - **Transaction history is unbounded**: `findHistoryForClient` returns every row for a client with no paging or limit, and `GET /clients/{id}/transactions` serializes the whole list, so a long-lived account loads and sends its entire ledger in one response. Combined with the unindexed query above and the lack of authentication, this is also the cheapest endpoint to make expensive.
 - **Closing is irreversible and retains all personal data**: `close()` is one-way — no endpoint reopens an account — and the soft delete keeps the name and phone number in the `client` table indefinitely. For an API holding personal data that is a retention decision worth making deliberately, and it means `DELETE /clients/{id}` does *not* satisfy a request to erase someone's data.
 - **`DELETE /clients/{id}` is not idempotent**: repeating it returns `404` rather than `204`, because a closed client is indistinguishable from a missing one (see [API Reference](#delete-clientsid)).
-- **Spring AI is configured but unused**: the starter adds a chat model, embedding model, chat client, chat memory and tool-calling beans to every context, and Compose adds a ~2.8 GB image, with no code calling any of it yet.
-- **Model calls to an unavailable Ollama hang for ~19 minutes**: Spring AI's default retry (10 attempts, back-off up to 3 minutes) runs on the caller's thread, so the first feature built on it will tie up request threads if Ollama is down (see [AI Integration](#ai-integration-spring-ai--ollama)).
-- **The model is not provisioned automatically**: `pull-model-strategy=never` and the Compose service has no init step, so on a fresh volume the first call fails until someone runs `ollama pull qwen2.5:3b` by hand.
+- **Spring AI auto-configures more than is used**: only `ChatClient.Builder` is used (by `TransactionQueryParser`), but every context also gets an embedding model, chat memory and tool-calling beans.
+- **Search hangs for ~19 minutes when Ollama is unavailable**: Spring AI's default retry (10 attempts, back-off up to 3 minutes) runs on the request thread, so each search holds a Tomcat thread that long before returning `503`, and keeps it busy even after the client disconnects. Verified for the first 75 s (see [AI Integration](#ai-integration-spring-ai--ollama)).
+- **The model is not provisioned automatically**: `pull-model-strategy=never` and the Compose service has no init step, so on a fresh volume every search returns `503` until someone runs `ollama pull qwen2.5:7b` (~4.7 GB) by hand. A volume that only has `qwen2.5:3b` from the previous setting has the same problem.
 - **`ollama/ollama:latest` is unpinned**: unlike `postgres:16-alpine`, the Ollama image floats, so two developers (or two days) can run different server versions. The Ollama service also has no healthcheck, so `docker compose ps` can't say when it is ready.
-- **Ollama runs on CPU in Docker Desktop for macOS**: containers there cannot use the Mac GPU, so the model is slower in `banking-ollama` than in the native Ollama app — which, if installed, also competes for port `11434`.
+- **Ollama runs on CPU in Docker Desktop for macOS**: containers there cannot use the Mac GPU, so the model is slower in `banking-ollama` than in the native Ollama app — which, if installed, also competes for port `11434`. The 12–17 s search times measured above were taken under these conditions.
 - **No authentication/authorization**: every endpoint is unauthenticated and unauthorized — anyone who can reach port 8080 can read all client data and move money between any two accounts.
 - **`spring.jpa.open-in-view` is enabled by default**: Spring logs a warning about this on every startup. It keeps the Hibernate session open for the whole request, which can hide lazy-loading issues and hold DB connections longer than necessary; it's worth setting explicitly to `false`.
-- **The generated OpenAPI spec is incomplete**: springdoc now publishes Swagger UI and an OpenAPI 3.1 document, but it reports `200` for `POST /clients` (actually `201`), describes no error responses, and drops the `@Positive`/`@PositiveOrZero` bounds — see [API Documentation](#api-documentation). Until `@ApiResponse`/`@Operation` annotations are added, the spec cannot be used as the contract on its own.
+- **The generated OpenAPI spec is incomplete**: springdoc now publishes Swagger UI and an OpenAPI 3.1 document, but it reports `200` for `POST /clients` (actually `201`), describes no error responses (including search's `503`), and drops the `@Positive`/`@PositiveOrZero` bounds — see [API Documentation](#api-documentation). Until `@ApiResponse`/`@Operation` annotations are added, the spec cannot be used as the contract on its own.
 - **No logging/observability beyond opt-in SQL logging**: the `dev` profile logs queries, but there's no structured application logging, metrics, or health-check endpoint (no Spring Boot Actuator dependency).
 - **Credentials default to `postgres`/`postgres`**: `DB_USER`/`DB_PASSWORD` fall back to a well-known development credential pair. That's convenient locally, but any deployment that forgets to set them starts up with guessable credentials rather than failing fast — dropping the defaults (`${DB_PASSWORD}` with no fallback) would surface the misconfiguration at startup.

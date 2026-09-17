@@ -1,5 +1,6 @@
 package com.roladio.banking.controller;
 
+import com.roladio.banking.ai.TransactionQueryParser;
 import com.roladio.banking.dto.*;
 import com.roladio.banking.service.ClientService;
 import jakarta.validation.Valid;
@@ -16,9 +17,11 @@ import java.util.List;
 public class ClientController {
 
     private final ClientService clientService;
+    private final TransactionQueryParser queryParser;
 
-    public ClientController(ClientService clientService) {
+    public ClientController(ClientService clientService, TransactionQueryParser queryParser) {
         this.clientService = clientService;
+        this.queryParser = queryParser;
     }
 
     @GetMapping
@@ -79,5 +82,13 @@ public class ClientController {
     @GetMapping("/{id}/transactions")
     public List<TransactionResponse> getClientHistory(@PathVariable Long id) {
         return clientService.getClientHistory(id);
+    }
+
+    @GetMapping("/{id}/transactions/search")
+    public List<TransactionResponse> searchTransactions(@PathVariable Long id,
+                                                        @RequestParam String q) {
+        TransactionFilter filter = queryParser.parse(q);
+
+        return clientService.searchTransactions(id, filter);
     }
 }
