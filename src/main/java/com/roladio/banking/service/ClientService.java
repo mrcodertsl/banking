@@ -9,6 +9,9 @@ import com.roladio.banking.repository.TransactionRepository;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneOffset;
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -105,6 +108,32 @@ public class ClientService {
         return transactionRepository.findHistoryForClient(id).stream()
                 .map(this::toTransactionResponse)
                 .collect(Collectors.toList());
+    }
+
+    public List<TransactionResponse> searchTransactions(Long id, TransactionFilter filter) {
+        findClientById(id);
+
+        Instant fromInstant = toStartOfDay(filter.from());
+        Instant toInstant = toStartOfNextDay(filter.to());
+
+        return transactionRepository.search(
+                        id,
+                        filter.minAmount(),
+                        filter.maxAmount(),
+                        fromInstant,
+                        toInstant,
+                        filter.counterpartyId())
+                .stream()
+                .map(this::toTransactionResponse)
+                .collect(Collectors.toList());
+    }
+
+    private Instant toStartOfDay(LocalDate date) {
+        return date == null ? null : date.atStartOfDay().toInstant(ZoneOffset.UTC);
+    }
+
+    private Instant toStartOfNextDay(LocalDate date) {
+        return date == null ? null : date.plusDays(1).atStartOfDay().toInstant(ZoneOffset.UTC);
     }
 
     private Client findClientById(Long id) {

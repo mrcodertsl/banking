@@ -51,6 +51,7 @@ src/main/java/com/roladio/banking
 │   ├── LastNameRequest.java     # PATCH .../lastName body (no constraints — see API Reference)
 │   ├── PhoneNumberRequest.java  # PATCH .../phoneNumber body
 │   ├── TransferRequest.java     # POST /clients/transfer body
+│   ├── TransactionFilter.java   # optional history search criteria; not bound to any endpoint yet
 │   └── TransactionResponse.java # one entry in GET /clients/{id}/transactions
 ├── exceptions/
 │   ├── ClientNotFoundException.java     # unchecked; carries "Client not found: <id>" -> 404
@@ -63,9 +64,9 @@ src/main/java/com/roladio/banking
 │   └── TransactionType.java      # enum, currently just TRANSFER
 ├── repository/
 │   ├── ClientRepository.java     # JpaRepository + row-locking and closed-filtering lookups
-│   └── TransactionRepository.java # JpaRepository + a per-client history query
+│   └── TransactionRepository.java # JpaRepository + per-client history and filtered search queries
 └── service/
-    └── ClientService.java        # business logic: lookups, updates, transfers, closing, history
+    └── ClientService.java        # business logic: lookups, updates, transfers, closing, history, search
 
 src/main/resources/
 ├── application.properties        # base config; datasource via DB_* env vars
@@ -226,6 +227,78 @@ public record TransactionResponse(
 > | `from_id = ? or to_id = ?` (FK columns) | BitmapOr over `idx_transaction_from_id` + `idx_transaction_to_id` | 0.12 ms |
 >
 > That is roughly 70× on a small table, and the gap widens with volume: the current plan costs a scan of the *whole* table, while the indexed plan costs only the matching rows. The two indexes `V5` created for exactly this lookup are currently never consulted. Restructuring so the predicate lands on the FK columns — for instance selecting the matching ids in a subquery and fetching the associations around it — restores the index scan while keeping the eager fetch.
+
+#### Searching history — `TransactionRepository.search` (not wired up, currently broken)
+
+A filtered variant of the history query has been added, but **no endpoint calls it and no test covers it** — and, as shown below, every call to it currently fails.
+
+The criteria arrive as a new record, `dto/TransactionFilter`, in which every field is optional:
+
+```java
+public record TransactionFilter(
+        BigDecimal minAmount,
+        BigDecimal maxAmount,
+        LocalDate from,
+        LocalDate to,
+        Long counterpartyId) {}
+```
+
+`ClientService.searchTransactions(id, filter)` checks the client exists and is open via `findClientById` (unknown or closed → `ClientNotFoundException`, as for plain history), converts the two dates to instants, and passes everything to one JPQL query that makes each filter optional with the `(:param is null or …)` pattern:
+
+```java
+where (t.from.id = :clientId or t.to.id = :clientId)
+  and (:minAmount is null or t.amount >= :minAmount)
+  and (:maxAmount is null or t.amount <= :maxAmount)
+  and (:fromInstant is null or t.createdAt >= :fromInstant)
+  and (:toInstant is null or t.createdAt < :toInstant)
+  and (:counterpartyId is null or t.from.id = :counterpartyId or t.to.id = :counterpartyId)
+order by t.createdAt desc
+```
+
+It fetches both parties and orders newest first, exactly like `findHistoryForClient`, and results map through the same `toTransactionResponse`.
+
+| Filter | Meaning | Bound |
+|---|---|---|
+| `minAmount` | `amount >= minAmount` | inclusive |
+| `maxAmount` | `amount <= maxAmount` | inclusive |
+| `from` | `createdAt >=` **00:00 UTC** on that date | inclusive |
+| `to` | `createdAt <` **00:00 UTC the day after** that date | inclusive of the whole day |
+| `counterpartyId` | the other side of the transfer, in either direction | — |
+
+> ⚠️ **Every call fails on PostgreSQL** — with no filters, with all filters, and anything in between:
+>
+> ```
+> InvalidDataAccessResourceUsageException:
+>   ERROR: could not determine data type of parameter $7
+> ```
+>
+> Hibernate expands each named parameter into a separate positional one, so `:fromInstant is null` becomes a bare `? is null`. Parameter `$7` is that first `Instant` occurrence: the driver sends it without a declared type (whether its value is null or not), and a bare `? is null` gives PostgreSQL nothing to infer one from, so the statement is rejected when it is prepared. The `BigDecimal` and `Long` parameters in the same positions do not have this problem. Verified against the Testcontainers PostgreSQL.
+>
+> Only the two date checks need to change. Writing them as `cast(:fromInstant as Instant) is null` and `cast(:toInstant as Instant) is null` makes the query run, and gives the results below.
+
+Behavior with that one change applied, on the `V6` seed data for client 1 (68 rows), matched against equivalent hand-written SQL:
+
+| Filter | Rows |
+|---|---|
+| none | 68 — identical to `findHistoryForClient` |
+| `minAmount = 1000` | 9 |
+| `maxAmount = 50` | 14 |
+| `minAmount = maxAmount = 83.25` | 1 — both bounds inclusive |
+| `minAmount = 500`, `maxAmount = 100` | 0 — no error for an inverted range |
+| `counterpartyId = 2` | 34 |
+| `counterpartyId = 1` (the client itself) | **68 — every row, not zero** |
+| `counterpartyId = 4` or `999` | 0 — no error for a client with no shared transfers, or one that does not exist |
+| `from = to =` today | 1 |
+| `from` later than `to` | 0 — no error |
+| `minAmount = 100`, `maxAmount = 1000`, last 90 days, `counterpartyId = 3` | 7 |
+
+Three behaviors are worth knowing before this reaches an endpoint:
+
+- **A client named as its own counterparty disables the filter.** The client is always one side of every row, so `t.from.id = :counterpartyId or t.to.id = :counterpartyId` is true for all of them. The answer is the unfiltered history rather than an empty list.
+- **Dates are UTC calendar days.** `LocalDate` is turned into an instant with `ZoneOffset.UTC`, not the caller's or the server's zone. Verified: a transfer made at `2026-01-11 00:30` in UTC+2 is `2026-01-10 22:30` UTC, so it is returned for `from = to = 2026-01-10` and not for `2026-01-11`.
+- **`filter` itself must not be `null`.** `searchTransactions` calls `filter.from()` straight away, so a `null` filter throws `NullPointerException`; "no filters" means a `TransactionFilter` with all fields `null`.
+
+`TransactionFilter` carries no validation annotations (no `@Positive` on the amounts, and no check that `from` is not after `to`), and its `LocalDate` fields have no `@DateTimeFormat`. How it will bind from query parameters depends on the endpoint that eventually exposes it.
 
 > ⚠️ **`createdAt` is `null` on a freshly persisted instance.** Because the column is `insertable = false`, Hibernate omits it from the `INSERT` and does not read it back, so the value exists in the database but not on the object in memory. Verified against a real database: after `persist` + `flush` the entity has its generated `id` but `createdAt == null`; only after a refresh or reload does it populate.
 >
@@ -854,6 +927,7 @@ class BankingApplicationTests {
 
 **Remaining gaps**
 
+- **`TransactionRepository.search` / `ClientService.searchTransactions` have no tests at all** — which is how a query that fails on every call went unnoticed while the suite stays green. A single integration test calling it with an empty `TransactionFilter` would have caught it.
 - **`GET /clients/{id}/transactions` has no controller-slice test.** The service method is covered by integration tests, but nothing asserts the HTTP mapping — the `200` array shape or the `404` problem document.
 - **The history tests are shallow in places.** `transfer_savesTransactionRecord` matches `any(Transaction.class)`, so it would pass if the wrong parties, amount or type were recorded; the integration test's two `isNotEmpty()` checks on the histories of clients 1 and 2 are now **always true before the transfer even happens**, because `V6` seeds both — so they no longer prove anything, and only the `getFirst()` assertions on client 1's history test the new row; and there is no unit test for `getClientHistory` or for the `TransactionResponse` mapping (including the `null` last-name case). The integration test's `getFirst()` check is reliable despite the shared database only because the test's own transfer is the most recent one.
 - **No test covers history for a closed client** — neither the `404` on its own history nor its transfers remaining visible to a counterparty.
@@ -911,10 +985,13 @@ Two details make this work without extra setup:
 - **`ClientRequest` serves two endpoints with different semantics**: `balance` seeds the opening balance on `POST /clients`, but is required-and-ignored on `PUT /clients/{id}` (see [API Reference](#put-clientsid)). Splitting it into `CreateClientRequest` / `UpdateClientRequest` would make both contracts honest.
 - **`updateClient_updatesAllFields` is now misnamed**: it no longer asserts anything about balance, because the endpoint no longer changes it — the name promises more than the test checks.
 - **`createClient`'s test doesn't verify the saved entity**: it stubs `repository.save(any(Client.class))` and only checks the returned `ClientResponse`, so a bug that dropped a field before calling `save` (e.g. forgetting to copy `phoneNumber`) wouldn't be caught. `POST /clients` also has no controller-slice or integration coverage, so its `201` and `Location` header are untested (see [Testing](#testing)).
+- **History search fails on every call**: `TransactionRepository.search` is rejected by PostgreSQL with `could not determine data type of parameter $7`, because the `:fromInstant is null` / `:toInstant is null` checks give the database no type for an `Instant` parameter. Nothing calls it yet, so the application runs normally — it becomes a `500` as soon as an endpoint does. Casting both checks (`cast(:fromInstant as Instant) is null`) makes it run (see [Data Model](#searching-history--transactionrepositorysearch-not-wired-up-currently-broken)).
+- **History search has edge cases to settle before it is exposed**: naming the client as its own `counterpartyId` returns the full history rather than nothing; date filters use UTC calendar days regardless of the caller's zone; inverted amount or date ranges silently return `[]`; a `null` filter throws `NullPointerException`; and `TransactionFilter` has no validation.
+- **Two queries overlap**: `search` with no filters returns exactly what `findHistoryForClient` does, so the history endpoint could be served by `search` and the older query removed, once `search` works.
 - **A closed client's history is unreachable**: `GET /clients/{id}/transactions` resolves the client through the closed-filtering lookup, so once an account is closed its own statement answers `404`, even though every row survives in the `transaction` table. Its transfers stay visible only from the counterparty's side.
 - **History entries carry no direction**: the response has no in/out indicator or signed amount, so a consumer has to compare `fromId` with the requested id to know whether money arrived or left.
 - **`fromName`/`toName` render as `"Cher null"` when a client has no last name**: `TransactionResponse` builds the display name with `getFirstName() + " " + getLastName()`, and `last_name` is nullable with no `@NotBlank` on `ClientRequest.lastName` — so a client created without one is reachable through the public API and its name renders with a literal `null`. Verified end-to-end through `GET /clients/{id}/transactions`.
-- **`findHistoryForClient` bypasses the `V5` indexes**: filtering on the fetch-joined aliases makes PostgreSQL scan the whole `transaction` table instead of using `idx_transaction_from_id`/`idx_transaction_to_id` — measured at ~70× slower on 40k rows, degrading further as volume grows. Now that `GET /clients/{id}/transactions` calls it, this is on a live, public path (see [Data Model](#reading-history--transactionrepository)).
+- **`findHistoryForClient` bypasses the `V5` indexes**: filtering on the fetch-joined aliases makes PostgreSQL scan the whole `transaction` table instead of using `idx_transaction_from_id`/`idx_transaction_to_id` — measured at ~70× slower on 40k rows, degrading further as volume grows. Now that `GET /clients/{id}/transactions` calls it, this is on a live, public path (see [Data Model](#reading-history--transactionrepository)). The new `search` query filters on the same aliases (Hibernate renders `f1_0.id=? or t2_0.id=?`), so it inherits the problem, and its optional-filter pattern makes a well-indexed plan harder still.
 - **Seeded history contradicts seeded balances**: `V6` inserts 100 transfers without adjusting any balance, so a client's history does not sum to its balance, and replayed in order it would drive clients 2 and 3 negative — something the application forbids (see [Seed transactions](#seed-transactions-v6)). Anything that reconciles balances against the ledger will report every seeded client as wrong.
 - **Sample data ships in versioned migrations**: `V2`, `V3` and now `V6` are ordinary Flyway migrations, so any database this application is pointed at — including a production one — receives four fake clients and 100 fake transfers between them. Moving seed scripts to a separate location enabled only for local profiles (e.g. `spring.flyway.locations` per profile) would keep them out.
 - **Transaction history is unbounded**: `findHistoryForClient` returns every row for a client with no paging or limit, and `GET /clients/{id}/transactions` serializes the whole list, so a long-lived account loads and sends its entire ledger in one response. Combined with the unindexed query above and the lack of authentication, this is also the cheapest endpoint to make expensive.
