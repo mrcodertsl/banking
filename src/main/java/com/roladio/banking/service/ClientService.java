@@ -4,6 +4,7 @@ import com.roladio.banking.dto.*;
 import com.roladio.banking.exceptions.ClientNotFoundException;
 import com.roladio.banking.model.Client;
 import com.roladio.banking.model.Transaction;
+import com.roladio.banking.model.TransactionDirection;
 import com.roladio.banking.repository.ClientRepository;
 import com.roladio.banking.repository.TransactionRepository;
 import org.springframework.stereotype.Service;
@@ -111,7 +112,7 @@ public class ClientService {
         findClientById(id);
 
         return transactionRepository.findHistoryForClient(id).stream()
-                .map(this::toTransactionResponse)
+                .map(transaction -> toTransactionResponse(transaction, id))
                 .collect(Collectors.toList());
     }
 
@@ -126,7 +127,7 @@ public class ClientService {
 
         return transactionRepository.search(id, minAmount, maxAmount, fromInstant, toInstant, counterpartyId)
                 .stream()
-                .map(this::toTransactionResponse)
+                .map(transaction -> toTransactionResponse(transaction, id))
                 .collect(Collectors.toList());
     }
 
@@ -152,13 +153,18 @@ public class ClientService {
         );
     }
 
-    private TransactionResponse toTransactionResponse(Transaction transaction) {
+    private TransactionResponse toTransactionResponse(Transaction transaction, Long viewerId) {
         Client from = transaction.getFrom();
         Client to = transaction.getTo();
+
+        TransactionDirection direction = from.getId().equals(viewerId)
+                ? TransactionDirection.OUTGOING
+                : TransactionDirection.INCOMING;
 
         return new TransactionResponse(
                 transaction.getId(),
                 transaction.getType(),
+                direction,
                 from.getId(),
                 from.getFirstName() + " " + from.getLastName(),
                 to.getId(),

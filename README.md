@@ -17,6 +17,7 @@ A small Spring Boot REST API for managing bank clients and transferring money be
 - [API Documentation](#api-documentation)
 - [API Reference](#api-reference)
 - [AI-powered transaction search](#ai-powered-transaction-search)
+- [MCP server](#mcp-server)
 - [Error Handling](#error-handling)
 - [Concurrency](#concurrency)
 - [Testing](#testing)
@@ -38,6 +39,7 @@ A small Spring Boot REST API for managing bank clients and transferring money be
 | Build tool | Maven, via the included `./mvnw` / `mvnw.cmd` wrapper (Maven 3.9.16, wrapper 3.3.4 — see `.mvn/wrapper/maven-wrapper.properties`) |
 | Test framework | JUnit 5, Mockito 5.14.2, AssertJ, MockMvc / `@WebMvcTest` (`spring-boot-starter-webmvc-test`) |
 | Natural-language search | Spring AI 2.0 with Ollama (`qwen2.5:7b`) for natural-language search — Spring AI 2.0.1 (`spring-ai-starter-model-ollama`, versions from the imported `spring-ai-bom`) talking to a local [Ollama](https://ollama.com) server, used by `TransactionQueryParser` to turn plain-language search text into a filter; see [AI-powered transaction search](#ai-powered-transaction-search) and [AI Integration](#ai-integration-spring-ai--ollama) |
+| MCP server | Spring AI MCP server (Streamable-HTTP) exposing read-only banking tools to AI agents — `spring-ai-starter-mcp-server-webmvc`, versioned by the same imported `spring-ai-bom`; see [MCP server](#mcp-server) |
 | Integration testing | Testcontainers 2.0.5 (`spring-boot-testcontainers`, `testcontainers-postgresql`, `testcontainers-junit-jupiter`) — spins up a real PostgreSQL in Docker for the context test |
 
 ## Project Structure
@@ -46,8 +48,10 @@ A small Spring Boot REST API for managing bank clients and transferring money be
 src/main/java/com/roladio/banking
 ├── BankingApplication.java      # @SpringBootApplication entry point
 ├── ai/
+│   ├── BankingTools.java        # @Tool-annotated read-only methods, published over MCP
 │   └── TransactionQueryParser.java # asks the LLM to turn search text into a TransactionFilter
 ├── config/
+│   ├── McpConfig.java           # registers BankingTools as MCP tool callbacks
 │   └── OpenApiConfig.java       # OpenAPI document metadata (title/description/version)
 ├── controller/
 │   └── ClientController.java    # REST endpoints, mapped under /clients
@@ -68,6 +72,7 @@ src/main/java/com/roladio/banking
 ├── model/
 │   ├── Client.java               # JPA entity mapped to the `client` table
 │   ├── Transaction.java          # JPA entity for `transaction` — one row written per transfer
+│   ├── TransactionDirection.java # enum INCOMING/OUTGOING — computed per reader, never stored
 │   └── TransactionType.java      # enum, currently just TRANSFER
 ├── repository/
 │   ├── ClientRepository.java     # JpaRepository + row-locking and closed-filtering lookups
@@ -92,7 +97,7 @@ All DTOs are Java `record`s (immutable; request DTOs carry Bean Validation const
 
 `ClientController` is a thin layer: every method delegates to `ClientService`, except `searchTransactions`, which first passes the `q` text to `TransactionQueryParser` and then hands the resulting `TransactionFilter` to the service. The mutating endpoints (`PATCH`/`PUT`/`DELETE`/`POST /transfer`) are `void` and annotated `@ResponseStatus(HttpStatus.NO_CONTENT)`, so they answer `204`. The `GET` endpoints answer `200` with a `ClientResponse` or a list of them, or a list of `TransactionResponse` for the history and search routes. `POST /clients` builds its own `201` response.
 
-`ClientService` maps entities to DTOs through two private helpers, `toResponse(Client)` and `toTransactionResponse(Transaction)`, and persists through **JPA dirty checking** rather than explicit saves: every mutating method is `@Transactional` and loads its entity through the repository (`findByIdAndClosedFalse`, or the locking `findByIdForUpdate` in `transfer` — see [Concurrency](#concurrency)), so the entity is managed and Hibernate flushes the changes at commit. Only `createClient` calls `clientRepository.save(...)`, because a brand-new entity has to be made managed first. This means the absence of a `save(...)` call in `updatePhoneNumber`, `updateLastName`, `updateClient`, and `transfer` is deliberate, not an oversight.
+`ClientService` maps entities to DTOs through two private helpers, `toResponse(Client)` and `toTransactionResponse(Transaction, Long)` — the second also takes the id of the client whose history is being read, which is what `direction` is relative to — and persists through **JPA dirty checking** rather than explicit saves: every mutating method is `@Transactional` and loads its entity through the repository (`findByIdAndClosedFalse`, or the locking `findByIdForUpdate` in `transfer` — see [Concurrency](#concurrency)), so the entity is managed and Hibernate flushes the changes at commit. Only `createClient` calls `clientRepository.save(...)`, because a brand-new entity has to be made managed first. This means the absence of a `save(...)` call in `updatePhoneNumber`, `updateLastName`, `updateClient`, and `transfer` is deliberate, not an oversight.
 
 The model is not anemic: `Client` enforces its own invariants through `withdraw`/`deposit`/`close` (see [Data Model](#data-model)), so the service orchestrates but never performs balance arithmetic, funds checks, or closure checks itself.
 
@@ -212,15 +217,17 @@ List<Transaction> findHistoryForClient(@Param("clientId") Long clientId);
 
 The two `join fetch` clauses are the point of writing this by hand: `from` and `to` are `FetchType.LAZY`, so rendering a list of transactions would otherwise fire two extra selects per row. Fetching both in the same statement collapses that to a single query.
 
-`ClientService.getClientHistory(id)` calls it, first resolving the client through `findClientById` so an unknown or closed id raises `ClientNotFoundException` (`404`) rather than silently returning an empty list. Results map to `TransactionResponse`, which flattens each party into an id and a display name:
+`ClientService.getClientHistory(id)` calls it, first resolving the client through `findClientById` so an unknown or closed id raises `ClientNotFoundException` (`404`) rather than silently returning an empty list. Results map to `TransactionResponse`, which flattens each party into an id and a display name, and adds the direction the money moved as seen by the client being read:
 
 ```java
 public record TransactionResponse(
-        Long id, TransactionType type,
+        Long id, TransactionType type, TransactionDirection direction,
         Long fromId, String fromName,
         Long toId, String toName,
         BigDecimal amount, Instant createdAt) {}
 ```
+
+`direction` is not a column and is not stored anywhere. `toTransactionResponse(transaction, viewerId)` compares the transfer's sender with the id whose history is being read — equal means `OUTGOING`, anything else `INCOMING` — so the **same row is `OUTGOING` in the sender's history and `INCOMING` in the recipient's**. Both history routes pass the `{id}` from the path, so the value always answers "in or out for the client I asked about". `ClientServiceIntegrationTest` asserts exactly that on one transfer, from both sides.
 
 `ClientController` exposes it as **`GET /clients/{id}/transactions`** (see [API Reference](#get-clientsidtransactions)), a thin delegate like every other route.
 
@@ -414,9 +421,13 @@ spring.ai.ollama.init.pull-model-strategy=never
 spring.ai.retry.max-attempts=1
 spring.ai.ollama.read-timeout=60s
 spring.ai.ollama.connect-timeout=2s
+spring.ai.mcp.server.name=banking-api
+spring.ai.mcp.server.version=1.0.0
+spring.ai.mcp.server.instructions=Read-only access to bank clients and their transfer history.
+spring.ai.mcp.server.protocol=STREAMABLE
 ```
 
-The `spring.ai.*` block is explained in [AI Integration](#ai-integration-spring-ai--ollama).
+The `spring.ai.ollama.*` and `spring.ai.retry.*` lines are explained in [AI Integration](#ai-integration-spring-ai--ollama); the `spring.ai.mcp.server.*` lines in [MCP server](#mcp-server). None of them carry credentials or hosts that differ per environment, so only the `DB_*` and `OLLAMA_URL` values below are externalized.
 
 Connection settings are externalized as environment variables with `${VAR:default}` fallbacks, so no credentials need to be edited into the file to run locally, and the same build can be pointed at another database without a rebuild:
 
@@ -458,7 +469,9 @@ There is no `application-test.properties` or `test` profile. `BankingApplication
 
 The LLM client is now used by one feature: **plain-language transaction search**. `GET /clients/{id}/transactions/search?q=…` sends the `q` text to a local Ollama model, which turns it into a `TransactionFilter`, and then runs the regular database search (see [Searching history](#searching-history--transactionrepositorysearch)). The model **only builds the filter**. It never sees transaction data, and the database query decides which rows come back.
 
-**Dependency.** `pom.xml` adds `spring-ai-starter-model-ollama` without a version, and imports `org.springframework.ai:spring-ai-bom:2.0.1` in a `<dependencyManagement>` block to supply it. The starter brings in the Ollama client plus Spring AI's chat-client, chat-memory, tool-calling, retry and observation auto-configuration.
+The MCP server added alongside it points the other way: there the *client* is the model, and this application is the tool provider. It uses no `ChatModel` and never calls Ollama.
+
+**Dependency.** `pom.xml` adds `spring-ai-starter-model-ollama` without a version, and imports `org.springframework.ai:spring-ai-bom:2.0.1` in a `<dependencyManagement>` block to supply it. `spring-ai-starter-mcp-server-webmvc` is declared the same way and takes its version from the same BOM — that starter is the other half of Spring AI in this project and is unrelated to Ollama (see [MCP server](#mcp-server)). The starter brings in the Ollama client plus Spring AI's chat-client, chat-memory, tool-calling, retry and observation auto-configuration.
 
 **Beans created at startup.** Because of that auto-configuration, every application context (the test contexts too) contains, among others:
 
@@ -614,7 +627,7 @@ A plain `docker compose up -d` also starts `banking-ollama`, which downloads the
    ./mvnw spring-boot:run
    ```
    On Windows: `mvnw.cmd spring-boot:run`. Add `-Dspring-boot.run.profiles=dev` to see the SQL it runs.
-4. The API is available at `http://localhost:8080`. Flyway applies any pending migrations (V1 table creation, V2 seed data, V3 seed-data overwrite, V4 soft-delete column, V5 transaction table, V6 seed transactions) automatically before the app finishes starting.
+4. The API is available at `http://localhost:8080`, and the MCP endpoint at `http://localhost:8080/mcp` (see [MCP server](#mcp-server)). Flyway applies any pending migrations (V1 table creation, V2 seed data, V3 seed-data overwrite, V4 soft-delete column, V5 transaction table, V6 seed transactions) automatically before the app finishes starting.
 
 **Building a runnable jar**
 
@@ -641,19 +654,20 @@ public OpenAPI bankingOpenAPI() {
 }
 ```
 
-The emitted document is **OpenAPI 3.1.0** and covers all ten operations and all six DTO schemas (`TransactionResponse` included — its `type` is rendered as a string enum `["TRANSFER"]` and `createdAt` as `date-time`). `/swagger-ui.html` is a convenience path — it answers `302` and redirects to `/swagger-ui/index.html`, which is where the UI is actually served.
+The emitted document is **OpenAPI 3.1.0** and covers all ten operations and all six DTO schemas (`TransactionResponse` included — its `type` is rendered as a string enum `["TRANSFER"]`, `direction` as `["INCOMING", "OUTGOING"]` and `createdAt` as `date-time`). `/swagger-ui.html` is a convenience path — it answers `302` and redirects to `/swagger-ui/index.html`, which is where the UI is actually served.
 
 > ⚠️ **The generated spec is an explorer, not the full contract.** Three things it does not capture, so this README remains authoritative:
 >
 > - **`POST /clients` is documented as `200`, but really returns `201`.** The status is built at runtime by `ResponseEntity.created(...)`, which springdoc cannot infer statically. The four `@ResponseStatus(NO_CONTENT)` endpoints *are* reported correctly as `204`.
 > - **No error responses are described at all** — none of the `400`, `404`, `409` or `503` outcomes (including the `404` from the history routes and the `503` from search), nor the RFC 7807 body they carry (see [Error Handling](#error-handling)). The search operation is listed with only its required `q` string parameter and a `200` array of `TransactionResponse`; nothing says the text is interpreted by an LLM or how long a call can take.
 > - **Only some constraints survive.** `@NotBlank`/`@NotNull` become `required` plus `minLength: 1`, but `@Positive` and `@PositiveOrZero` produce no `minimum` — `balance` and `amount` appear as a bare `number`, so the spec does not say they must be non-negative.
+> - **`POST /mcp` is not in the spec at all.** springdoc reads Spring MVC controller mappings, and the MCP endpoint is registered by the starter rather than by a `@RestController`. Its contract is JSON-RPC and is discovered through MCP's own `tools/list` — see [MCP server](#mcp-server).
 >
 > Adding `@ApiResponse`/`@Operation` annotations to `ClientController` would close all three.
 
 ## API Reference
 
-Base path: `/clients`. No authentication, no pagination, no content negotiation beyond JSON.
+Base path: `/clients`. No authentication, no pagination, no content negotiation beyond JSON. The MCP endpoint (`POST /mcp`) sits outside this base path and is not a REST route — see [MCP server](#mcp-server).
 
 ### Status codes at a glance
 
@@ -849,38 +863,40 @@ After closing, the client vanishes from `GET /clients`, `GET /clients/{id}` retu
 Returns every money movement the client took part in — as sender *or* recipient — newest first. Each transfer therefore appears in the history of both parties.
 
 ```bash
-curl http://localhost:8080/clients/3/transactions
+curl http://localhost:8080/clients/1/transactions
 ```
 
-**Response — `200 OK`** on a fresh database, where the list is the `V6` seed data — 66 entries for client 3, of which the two newest are shown (the timestamps depend on when the migration ran):
+**Response — `200 OK`**, an array of entries of this shape (one illustrative entry shown; on a fresh database the actual list is the `V6` seed data, whose timestamps depend on when the migration ran):
 
 ```json
 [
   {
-    "id": 100, "type": "TRANSFER",
-    "fromId": 3, "fromName": "Richard Miles",
-    "toId": 1, "toName": "John Doe",
-    "amount": 83.25, "createdAt": "2026-09-17T05:10:45.354415Z"
-  },
-  {
-    "id": 99, "type": "TRANSFER",
-    "fromId": 1, "fromName": "John Doe",
-    "toId": 3, "toName": "Richard Miles",
-    "amount": 979.12, "createdAt": "2026-09-15T06:40:45.354415Z"
+    "id": 1,
+    "type": "TRANSFER",
+    "direction": "OUTGOING",
+    "fromId": 1,
+    "fromName": "John Doe",
+    "toId": 2,
+    "toName": "Jane Roe",
+    "amount": 100.00,
+    "createdAt": "2026-09-15T10:23:45.123456Z"
   }
 ]
 ```
+
+`direction` is relative to the client whose history is being read: the same transfer is `OUTGOING` for the sender and `INCOMING` for the recipient.
 
 On a fresh database clients 1, 2 and 3 return 68, 66 and 66 entries; client 4 returns `[]` until it takes part in a transfer.
 
 | Field | Notes |
 |---|---|
 | `type` | Always `TRANSFER` today — the only `TransactionType` constant. |
+| `direction` | `OUTGOING` when this client sent the money, `INCOMING` when it received it. Derived per request from the `{id}` in the path, not stored (see [Data Model](#reading-history--transactionrepository)). |
 | `fromName` / `toName` | `firstName + " " + lastName`, built in `ClientService`. A client without a last name renders as e.g. `"Cher null"` (see [Known Issues](#known-issues--limitations)). |
 | `amount` | Read back from the `NUMERIC(19,2)` column, so always two decimal places (`100.00`), whatever scale the transfer request used. |
 | `createdAt` | ISO-8601 UTC instant with microsecond precision, taken from the database's `now()` at the start of the transfer's transaction. `V6` rows are backdated relative to the migration's `now()` instead. |
 
-There is no sign or direction field: whether an entry is money in or out for *this* client is only derivable by comparing `fromId`/`toId` with the `{id}` in the path.
+The amount itself is unsigned — `direction` is the only in/out indicator, so a consumer that wants a signed ledger has to apply the sign itself.
 
 A client with no transfers gets `200` with `[]`.
 
@@ -992,6 +1008,24 @@ curl "http://localhost:8080/clients/1/transactions/search?q=transfers%20over%201
 curl "http://localhost:8080/clients/1/transactions/search?q=big%20transfers%20over%20500%20in%20the%20last%20month"
 ```
 
+The rows come back in the same shape as the plain history route, `direction` included:
+
+```json
+[
+  {
+    "id": 1,
+    "type": "TRANSFER",
+    "direction": "OUTGOING",
+    "fromId": 1,
+    "fromName": "John Doe",
+    "toId": 2,
+    "toName": "Jane Roe",
+    "amount": 100.00,
+    "createdAt": "2026-09-15T10:23:45.123456Z"
+  }
+]
+```
+
 Returns `503 Service Unavailable` when the model is unreachable or the query cannot be interpreted. Every other endpoint keeps working.
 
 Every row in the table above was checked against `qwen2.5:7b` on 2026-09-17 by reading the parser's log line. On that run, "in the last month" became `from=2026-08-17, to=2026-09-17` (a rolling month), while the older example "big transfers last month" had given the previous calendar month. A query the model gets wrong is not an error, though: it returns `200` with the wrong filter applied. See [AI Integration](#ai-integration-spring-ai--ollama) for measured failures and timings.
@@ -1009,6 +1043,51 @@ Spring AI abstracts the provider, so switching to a hosted model (OpenAI, Anthro
 3. The filter is applied to the history of the client taken **from the path**, never from the model output — the model narrows results within an already-authorised scope and cannot widen access.
 
 Parsing is deterministic (`temperature=0`) and every parsed query is logged.
+
+## MCP server
+
+The application also exposes its read operations as [Model Context Protocol](https://modelcontextprotocol.io) tools, so an AI agent can query the bank directly instead of going through the REST API by hand.
+
+Transport is Streamable-HTTP on `POST /mcp`.
+
+| Tool | What it does |
+|---|---|
+| `listClients` | All open clients with id, name and balance |
+| `getClient` | One client by id |
+| `searchTransactions` | A client's transfer history, with optional amount, date and counterparty filters |
+
+Register it with an MCP-capable client — for example Claude Code:
+
+```bash
+claude mcp add --transport http banking http://localhost:8080/mcp
+```
+
+The application must be running. Once connected, the agent picks the tool and fills the parameters itself from a plain-language request such as *"show me John Doe's transfers over 1000 from the last three months"*.
+
+### Read-only by design
+
+`transfer` is deliberately **not** exposed as a tool. A tool that moves money can be triggered by any text the agent happens to read — a prompt injection in a document is enough. Write operations belong behind an explicit human confirmation, not behind a model's judgement.
+
+This matters twice over here: the Spring AI MCP starters expose an **unauthenticated** JSON-RPC endpoint, and apply no authorisation of their own. Anything reachable on `/mcp` can be listed and called by any client that can reach the port. That is acceptable for a read-only server on localhost; it would not be for anything that changes state.
+
+### How the tools are defined
+
+`BankingTools` annotates plain methods with `@Tool` and `@ToolParam`, and `McpConfig` registers them through a `MethodToolCallbackProvider`. Spring AI derives the JSON schema from each method signature — parameter types, required flags and descriptions all come from the code, so the schema cannot drift from the implementation.
+
+The descriptions are part of the contract, not comments: they are what the agent reads to decide which tool to call.
+
+### Configuration
+
+The server is turned on by the `spring-ai-starter-mcp-server-webmvc` dependency plus four properties in `application.properties`:
+
+| Property | Value | Effect |
+|---|---|---|
+| `spring.ai.mcp.server.name` | `banking-api` | Server name reported during the MCP handshake |
+| `spring.ai.mcp.server.version` | `1.0.0` | Server version reported during the handshake |
+| `spring.ai.mcp.server.instructions` | `Read-only access to bank clients and their transfer history.` | Sent to the client as the server's own description of itself |
+| `spring.ai.mcp.server.protocol` | `STREAMABLE` | Selects Streamable-HTTP (the `/mcp` endpoint) rather than the older SSE transport |
+
+The tools reuse `ClientService` unchanged, so an MCP call runs exactly the same lookups, closed-client filtering and queries as the equivalent REST request, and raises the same exceptions — an unknown or closed id throws `ClientNotFoundException` inside the tool call, where there is no `@RestControllerAdvice` to turn it into a problem document. Note also that `searchTransactions` is the *tool*, taking the five filter fields directly; it does not call `TransactionQueryParser`, so the MCP path needs no Ollama at all — the connected agent is the model doing the interpreting.
 
 ## Error Handling
 
@@ -1097,10 +1176,10 @@ Current state: **28 tests, all passing** (16 unit, 6 controller-slice, 5 integra
 
 | Test class | Type | Coverage |
 |---|---|---|
-| `BankingApplicationTests` | Integration (`@SpringBootTest` + `@Testcontainers`) | `contextLoads()` — boots the full application context against a disposable PostgreSQL container. Because startup runs Flyway and then `ddl-auto=validate`, this single test transitively proves that **V1→V6 apply cleanly to an empty database** and that the resulting schema **matches the `Client` entity**. |
+| `BankingApplicationTests` | Integration (`@SpringBootTest` + `@Testcontainers`) | `contextLoads()` — boots the full application context against a disposable PostgreSQL container. Because startup runs Flyway and then `ddl-auto=validate`, this single test transitively proves that **V1→V6 apply cleanly to an empty database** and that the resulting schema **matches the `Client` entity**. It now also covers the MCP server starter: the context contains `BankingTools`, `McpConfig`'s `ToolCallbackProvider` and the auto-configured MCP endpoint, so a tool method Spring AI cannot build a schema for would fail this test at startup. |
 | `service.ClientServiceTest` | Unit (Mockito-mocked `ClientRepository`, no DB) | `getAllClients` (mapping, size); `getClientById` plus its `ClientNotFoundException` path; `updatePhoneNumber`; `updateLastName`; `updateClient`; `createClient` (returns the saved client's id and mapped fields); `transfer` — happy path, same-account and insufficient-funds cases, and `transfer_savesTransactionRecord`, which verifies a `Transaction` is passed to `transactionRepository.save(...)`; `closeClient` with a zero and a non-zero balance; `searchTransactions_whenFilterIsEmpty_usesWideDefaults`, which passes an all-`null` `TransactionFilter` and checks that `transactionRepository.search(...)` gets `minAmount = 0` and the client's own id as `counterpartyId` (the upper amount bound and both instants are only matched with `any(...)`). Balance assertions use AssertJ's `isEqualByComparingTo` (scale-independent `BigDecimal` comparison) rather than `isEqualTo`. |
-| `service.ClientServiceIntegrationTest` | Integration (`@SpringBootTest` + `@Testcontainers`) | Drives the real `ClientService` against a real database: a transfer moves money and **both balances survive the commit**; a failed transfer (insufficient funds) **leaves both balances unchanged**, proving the rollback; closing a client (after draining its balance) **removes it from the listing and makes it read as not-found**; a transfer `1 → 2` **appears at the top of client 1's history** with the right ids, amount, a non-null `createdAt` and a resolved `fromName`, and shows up in client 2's history too; and `getClientHistory` for an unknown id throws `ClientNotFoundException`. |
-| `controller.ClientControllerTest` | Web slice (`@WebMvcTest(ClientController.class)` + `@MockitoBean` service and query parser) | Exercises the HTTP layer with MockMvc and no database: `404` + problem-document `status`/`detail` for an unknown id; `400` with `errors.amount` for a negative amount; `400` with `errors.{fromId,toId,amount}` for an empty body; `409` when the service reports insufficient funds; `searchTransactions_passesParsedFilterToService` (the stubbed parser's `TransactionFilter` reaches `clientService.searchTransactions`, and the result is returned as a `200` array); `searchTransactions_whenParsingFails_returns503` (a `QueryParsingException` from the parser becomes a `503` problem document). |
+| `service.ClientServiceIntegrationTest` | Integration (`@SpringBootTest` + `@Testcontainers`) | Drives the real `ClientService` against a real database: a transfer moves money and **both balances survive the commit**; a failed transfer (insufficient funds) **leaves both balances unchanged**, proving the rollback; closing a client (after draining its balance) **removes it from the listing and makes it read as not-found**; a transfer `1 → 2` **appears at the top of client 1's history** with the right ids, amount, a non-null `createdAt` and a resolved `fromName`, and shows up in client 2's history too — the same row, matched by `id`, reading `OUTGOING` for client 1 and `INCOMING` for client 2, which is the only test of the per-reader `direction`; and `getClientHistory` for an unknown id throws `ClientNotFoundException`. |
+| `controller.ClientControllerTest` | Web slice (`@WebMvcTest(ClientController.class)` + `@MockitoBean` service and query parser) | Exercises the HTTP layer with MockMvc and no database: `404` + problem-document `status`/`detail` for an unknown id; `400` with `errors.amount` for a negative amount; `400` with `errors.{fromId,toId,amount}` for an empty body; `409` when the service reports insufficient funds; `searchTransactions_passesParsedFilterToService` (the stubbed parser's `TransactionFilter` reaches `clientService.searchTransactions`, and the result is returned as a `200` array, with `$[0].direction` asserted to serialize as `"OUTGOING"`); `searchTransactions_whenParsingFails_returns503` (a `QueryParsingException` from the parser becomes a `503` problem document). |
 
 `ClientControllerTest` now also declares `@MockitoBean TransactionQueryParser`. `@WebMvcTest` doesn't pick up `@Component` classes, and the controller's constructor now needs the parser, so the slice can't create the controller without that mock. The two search tests stub it, so they cover the HTTP contract without Ollama.
 
@@ -1138,6 +1217,7 @@ class BankingApplicationTests {
 **Remaining gaps**
 
 - **Search is only partly tested.** The controller mapping, the `503` from `QueryParsingException`, and the `minAmount`/`counterpartyId` defaults in `ClientService.searchTransactions` are now covered. Still untested: `TransactionRepository.search` against a real database (the earlier version of this query failed on every call and the suite didn't notice), the `maxAmount`/date defaults (matched only with `any(...)`), `TransactionQueryParser` itself, a missing or empty `q`, and a search for an unknown client. An integration test calling `searchTransactions` with an all-`null` filter and then one test per filter would protect the query.
+- **Nothing tests the MCP layer.** `BankingTools` and `McpConfig` are only covered by the context test starting successfully. No test calls a tool method, checks the generated JSON schema, or drives the `/mcp` endpoint, so a renamed parameter or a reworded `@Tool` description — both of which change the contract the agent sees — would break nothing in the suite.
 - **`GET /clients/{id}/transactions` has no controller-slice test.** The service method is covered by integration tests, but nothing asserts the HTTP mapping — the `200` array shape or the `404` problem document.
 - **The history tests are shallow in places.** `transfer_savesTransactionRecord` matches `any(Transaction.class)`, so it would pass if the wrong parties, amount or type were recorded; the integration test's two `isNotEmpty()` checks on the histories of clients 1 and 2 are now **always true before the transfer even happens**, because `V6` seeds both — so they no longer prove anything, and only the `getFirst()` assertions on client 1's history test the new row; and there is no unit test for `getClientHistory` or for the `TransactionResponse` mapping (including the `null` last-name case). The integration test's `getFirst()` check is reliable despite the shared database only because the test's own transfer is the most recent one.
 - **No test covers history for a closed client** — neither the `404` on its own history nor its transfers remaining visible to a counterparty.
@@ -1185,7 +1265,7 @@ Two details make this work without extra setup:
 - `pom.xml` declares a real `<name>` and `<description>`. The empty `<url>`, `<licenses>`, `<developers>`, and `<scm>` placeholders that Spring Initializr generates have been removed, so those elements are now **inherited** from `spring-boot-starter-parent` (Apache License 2.0, the Spring team, and Spring Boot's SCM URLs). That only surfaces in the effective POM (`./mvnw help:effective-pom`) and in published artifact metadata; re-add them as empty self-closing tags to suppress the inheritance.
 - `.github/workflows/build.yml` is the only CI configuration — see [Continuous Integration](#continuous-integration).
 - `docker-compose.yml` provisions the local PostgreSQL and an Ollama server — the application itself is not containerized, so there is no `Dockerfile` and no app service in the Compose file. `docker compose up -d` then `./mvnw spring-boot:run` is the intended local loop (see [Running the App](#starting-postgresql-with-docker-compose)).
-- `pom.xml` now has a `<dependencyManagement>` section, used solely to import `spring-ai-bom` 2.0.1, so Spring AI artifacts are declared without versions.
+- `pom.xml` now has a `<dependencyManagement>` section, used solely to import `spring-ai-bom` 2.0.1, so Spring AI artifacts are declared without versions — both `spring-ai-starter-model-ollama` and `spring-ai-starter-mcp-server-webmvc` take their version from it.
 - The Spring Boot Maven plugin excludes Lombok from the final packaged jar (it's a compile-time-only, `optional` dependency).
 
 ## Known Issues & Limitations
@@ -1204,7 +1284,7 @@ Two details make this work without extra setup:
 - **Raw search text is logged**: every query is written at `INFO` (and at `WARN` with a stack trace on failure). The text is whatever the user typed, which may include personal details.
 - **Two queries overlap**: `search` with an all-`null` filter returns exactly what `findHistoryForClient` does, so the history endpoint could be served by `search` and the older query removed.
 - **A closed client's history is unreachable**: `GET /clients/{id}/transactions` resolves the client through the closed-filtering lookup, so once an account is closed its own statement answers `404`, even though every row survives in the `transaction` table. Its transfers stay visible only from the counterparty's side.
-- **History entries carry no direction**: the response has no in/out indicator or signed amount, so a consumer has to compare `fromId` with the requested id to know whether money arrived or left.
+- **`direction` is derived from the reader, not stored**: `toTransactionResponse` labels a row `OUTGOING` only when the client being read is the sender, and `INCOMING` in every other case. That is correct for both history routes, because their query guarantees the client is one of the two parties — but the `INCOMING` branch is an `else`, not a check, so reusing the mapper for a row the client took no part in would silently label it incoming. The same row also has no single truth: it is `OUTGOING` in one client's response and `INCOMING` in the other's, so a cached or forwarded `TransactionResponse` is only meaningful together with the id it was fetched for. The amount stays unsigned either way.
 - **`fromName`/`toName` render as `"Cher null"` when a client has no last name**: `TransactionResponse` builds the display name with `getFirstName() + " " + getLastName()`, and `last_name` is nullable with no `@NotBlank` on `ClientRequest.lastName` — so a client created without one is reachable through the public API and its name renders with a literal `null`. Verified end-to-end through `GET /clients/{id}/transactions`.
 - **`findHistoryForClient` bypasses the `V5` indexes**: filtering on the fetch-joined aliases makes PostgreSQL scan the whole `transaction` table instead of using `idx_transaction_from_id`/`idx_transaction_to_id` — measured at ~70× slower on 40k rows, degrading further as volume grows. Now that `GET /clients/{id}/transactions` calls it, this is on a live, public path (see [Data Model](#reading-history--transactionrepository)). The `search` query filters on the same aliases, so it has the same problem. It also always adds a second `from.id = ? or to.id = ?` check for the counterparty, even when that check is just the client's own id and matches every row.
 - **Seeded history contradicts seeded balances**: `V6` inserts 100 transfers without adjusting any balance, so a client's history does not sum to its balance, and replayed in order it would drive clients 2 and 3 negative — something the application forbids (see [Seed transactions](#seed-transactions-v6)). Anything that reconciles balances against the ledger will report every seeded client as wrong.
@@ -1213,11 +1293,14 @@ Two details make this work without extra setup:
 - **Closing is irreversible and retains all personal data**: `close()` is one-way — no endpoint reopens an account — and the soft delete keeps the name and phone number in the `client` table indefinitely. For an API holding personal data that is a retention decision worth making deliberately, and it means `DELETE /clients/{id}` does *not* satisfy a request to erase someone's data.
 - **`DELETE /clients/{id}` is not idempotent**: repeating it returns `404` rather than `204`, because a closed client is indistinguishable from a missing one (see [API Reference](#delete-clientsid)).
 - **Spring AI auto-configures more than is used**: only `ChatClient.Builder` is used (by `TransactionQueryParser`), but every context also gets an embedding model, chat memory and tool-calling beans.
+- **The MCP tools inherit every limit of the queries behind them**: `listClients` returns every open client and `searchTransactions` returns a client's whole unpaged history in one result, straight into the agent's context — on the unindexed query described above (see [Data Model](#reading-history--transactionrepository)). There is no limit, paging or rate limit on the tool side either, so an agent that asks for a busy account's full history pays for all of it.
+- **`searchTransactions` is one name for two different things**: the MCP tool takes the five filter fields directly, while the REST route of the same name takes free text and asks Ollama to produce them. They share `ClientService.searchTransactions` but not their input contract, which is worth remembering when reading logs or stack traces.
+- **Tool descriptions are untested contract**: the `@Tool`/`@ToolParam` text is what the agent reads to choose a tool and fill its arguments, so editing a description changes behaviour as surely as editing code — and nothing in the suite notices (see [Testing](#testing)).
 - **The Ollama timeout properties are ignored**: `spring.ai.ollama.read-timeout` and `spring.ai.ollama.connect-timeout` don't exist in Spring AI 2.0.1, so a search waits 30 s per connect attempt (62 s in total, measured) for an unreachable host, and **forever** for an Ollama that accepts the connection but doesn't answer. Turning off retries (`max-attempts=1`) did fix the old ~19-minute wait when nothing is listening. Replacing the two lines with `spring.http.clients.connect-timeout` / `spring.http.clients.read-timeout` was verified to work, but those settings apply to all auto-configured HTTP clients (see [AI Integration](#ai-integration-spring-ai--ollama)).
 - **The model is not provisioned automatically**: `pull-model-strategy=never` and the Compose service has no init step, so on a fresh volume every search returns `503` until someone runs `ollama pull qwen2.5:7b` (~4.7 GB) by hand. A volume that only has `qwen2.5:3b` from the previous setting has the same problem.
 - **`ollama/ollama:latest` is unpinned**: unlike `postgres:16-alpine`, the Ollama image floats, so two developers (or two days) can run different server versions. The Ollama service also has no healthcheck, so `docker compose ps` can't say when it is ready.
 - **Ollama runs on CPU in Docker Desktop for macOS**: containers there cannot use the Mac GPU, so the model is slower in `banking-ollama` than in the native Ollama app — which, if installed, also competes for port `11434`. The 12–17 s search times measured above were taken under these conditions.
-- **No authentication/authorization**: every endpoint is unauthenticated and unauthorized — anyone who can reach port 8080 can read all client data and move money between any two accounts.
+- **No authentication/authorization**: every endpoint is unauthenticated and unauthorized — anyone who can reach port 8080 can read all client data and move money between any two accounts. This now includes `POST /mcp`: the Spring AI MCP starter adds no authorisation of its own, so any client that can reach the port can run `tools/list` and call all three tools. Keeping `transfer` out of the tool list bounds the damage to reads, but it is the *only* thing bounding it (see [MCP server](#mcp-server)).
 - **`spring.jpa.open-in-view` is enabled by default**: Spring logs a warning about this on every startup. It keeps the Hibernate session open for the whole request, which can hide lazy-loading issues and hold DB connections longer than necessary; it's worth setting explicitly to `false`.
 - **The generated OpenAPI spec is incomplete**: springdoc now publishes Swagger UI and an OpenAPI 3.1 document, but it reports `200` for `POST /clients` (actually `201`), describes no error responses (including search's `503`), and drops the `@Positive`/`@PositiveOrZero` bounds — see [API Documentation](#api-documentation). Until `@ApiResponse`/`@Operation` annotations are added, the spec cannot be used as the contract on its own.
 - **No logging/observability beyond opt-in SQL logging**: the `dev` profile logs queries, but there's no structured application logging, metrics, or health-check endpoint (no Spring Boot Actuator dependency).

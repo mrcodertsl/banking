@@ -5,6 +5,7 @@ import com.roladio.banking.dto.TransactionResponse;
 import com.roladio.banking.dto.TransferRequest;
 import com.roladio.banking.exceptions.ClientNotFoundException;
 import com.roladio.banking.exceptions.InsufficientFundsException;
+import com.roladio.banking.model.TransactionDirection;
 import com.roladio.banking.repository.ClientRepository;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -94,6 +95,11 @@ class ClientServiceIntegrationTest {
         assertThat(latest.amount()).isEqualByComparingTo("25.00");
         assertThat(latest.createdAt()).isNotNull();
         assertThat(latest.fromName()).isNotBlank();
+        assertThat(latest.direction()).isEqualTo(TransactionDirection.OUTGOING);
+
+        TransactionResponse sameTransferSeenByRecipient = toHistory.getFirst();
+        assertThat(sameTransferSeenByRecipient.id()).isEqualTo(latest.id());
+        assertThat(sameTransferSeenByRecipient.direction()).isEqualTo(TransactionDirection.INCOMING);
     }
 
     @Test

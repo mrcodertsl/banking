@@ -6,6 +6,7 @@ import com.roladio.banking.dto.TransactionResponse;
 import com.roladio.banking.exceptions.ClientNotFoundException;
 import com.roladio.banking.exceptions.InsufficientFundsException;
 import com.roladio.banking.exceptions.QueryParsingException;
+import com.roladio.banking.model.TransactionDirection;
 import com.roladio.banking.model.TransactionType;
 import com.roladio.banking.service.ClientService;
 import org.junit.jupiter.api.Test;
@@ -91,14 +92,15 @@ public class ClientControllerTest {
 
         when(queryParser.parse("transfers over 1000")).thenReturn(filter);
         when(clientService.searchTransactions(1L, filter)).thenReturn(List.of(
-                new TransactionResponse(1L, TransactionType.TRANSFER,
+                new TransactionResponse(1L, TransactionType.TRANSFER, TransactionDirection.OUTGOING,
                         1L, "John Doe", 2L, "Jane Roe",
                         BigDecimal.valueOf(2500), Instant.now())));
 
         mockMvc.perform(get("/clients/1/transactions/search")
                         .param("q", "transfers over 1000"))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$[0].amount").value(2500));
+                .andExpect(jsonPath("$[0].amount").value(2500))
+                .andExpect(jsonPath("$[0].direction").value("OUTGOING"));
     }
 
     @Test
