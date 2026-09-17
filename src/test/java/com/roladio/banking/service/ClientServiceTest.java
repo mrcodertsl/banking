@@ -11,6 +11,7 @@ import com.roladio.banking.repository.TransactionRepository;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigDecimal;
+import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 
@@ -217,5 +218,24 @@ public class ClientServiceTest {
         service.transfer(new TransferRequest(1L, 2L, BigDecimal.valueOf(50)));
 
         verify(transactionRepository).save(any(Transaction.class));
+    }
+
+    @Test
+    void searchTransactions_whenFilterIsEmpty_usesWideDefaults() {
+        Client client = new Client(1L, "Anna", "Groban",
+                BigDecimal.valueOf(5000), "+12345678901", false);
+        when(repository.findByIdAndClosedFalse(1L)).thenReturn(Optional.of(client));
+        when(transactionRepository.search(any(), any(), any(), any(), any(), any()))
+                .thenReturn(List.of());
+
+        service.searchTransactions(1L, new TransactionFilter(null, null, null, null, null));
+
+        verify(transactionRepository).search(
+                eq(1L),
+                eq(BigDecimal.ZERO),
+                any(BigDecimal.class),
+                any(Instant.class),
+                any(Instant.class),
+                eq(1L));
     }
 }

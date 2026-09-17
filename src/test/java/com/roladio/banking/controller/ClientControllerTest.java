@@ -1,14 +1,22 @@
 package com.roladio.banking.controller;
 
 import com.roladio.banking.ai.TransactionQueryParser;
+import com.roladio.banking.dto.TransactionFilter;
+import com.roladio.banking.dto.TransactionResponse;
 import com.roladio.banking.exceptions.ClientNotFoundException;
 import com.roladio.banking.exceptions.InsufficientFundsException;
+import com.roladio.banking.exceptions.QueryParsingException;
+import com.roladio.banking.model.TransactionType;
 import com.roladio.banking.service.ClientService;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.webmvc.test.autoconfigure.WebMvcTest;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
+
+import java.math.BigDecimal;
+import java.time.Instant;
+import java.util.List;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doThrow;
@@ -74,5 +82,33 @@ public class ClientControllerTest {
                                 """))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.status").value(409));
+    }
+
+    @Test
+    void searchTransactions_passesParsedFilterToService() throws Exception {
+        TransactionFilter filter = new TransactionFilter(
+                BigDecimal.valueOf(1000), null, null, null, null);
+
+        when(queryParser.parse("transfers over 1000")).thenReturn(filter);
+        when(clientService.searchTransactions(1L, filter)).thenReturn(List.of(
+                new TransactionResponse(1L, TransactionType.TRANSFER,
+                        1L, "John Doe", 2L, "Jane Roe",
+                        BigDecimal.valueOf(2500), Instant.now())));
+
+        mockMvc.perform(get("/clients/1/transactions/search")
+                        .param("q", "transfers over 1000"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$[0].amount").value(2500));
+    }
+
+    @Test
+    void searchTransactions_whenParsingFails_returns503() throws Exception {
+        when(queryParser.parse(any()))
+                .thenThrow(new QueryParsingException(new RuntimeException("model down")));
+
+        mockMvc.perform(get("/clients/1/transactions/search")
+                        .param("q", "something"))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(jsonPath("$.status").value(503));
     }
 }

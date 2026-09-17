@@ -12,9 +12,11 @@ A small Spring Boot REST API for managing bank clients and transferring money be
 - [Database & Migrations](#database--migrations)
 - [Configuration](#configuration)
 - [AI Integration (Spring AI + Ollama)](#ai-integration-spring-ai--ollama)
+- [Prerequisites](#prerequisites)
 - [Running the App](#running-the-app)
 - [API Documentation](#api-documentation)
 - [API Reference](#api-reference)
+- [AI-powered transaction search](#ai-powered-transaction-search)
 - [Error Handling](#error-handling)
 - [Concurrency](#concurrency)
 - [Testing](#testing)
@@ -35,7 +37,7 @@ A small Spring Boot REST API for managing bank clients and transferring money be
 | Boilerplate reduction | Lombok |
 | Build tool | Maven, via the included `./mvnw` / `mvnw.cmd` wrapper (Maven 3.9.16, wrapper 3.3.4 — see `.mvn/wrapper/maven-wrapper.properties`) |
 | Test framework | JUnit 5, Mockito 5.14.2, AssertJ, MockMvc / `@WebMvcTest` (`spring-boot-starter-webmvc-test`) |
-| LLM client | Spring AI 2.0.1 (`spring-ai-starter-model-ollama`, versions from the imported `spring-ai-bom`) talking to a local [Ollama](https://ollama.com) server running `qwen2.5:7b` — used by `TransactionQueryParser` to turn plain-language search text into a filter; see [AI Integration](#ai-integration-spring-ai--ollama) |
+| Natural-language search | Spring AI 2.0 with Ollama (`qwen2.5:7b`) for natural-language search — Spring AI 2.0.1 (`spring-ai-starter-model-ollama`, versions from the imported `spring-ai-bom`) talking to a local [Ollama](https://ollama.com) server, used by `TransactionQueryParser` to turn plain-language search text into a filter; see [AI-powered transaction search](#ai-powered-transaction-search) and [AI Integration](#ai-integration-spring-ai--ollama) |
 | Integration testing | Testcontainers 2.0.5 (`spring-boot-testcontainers`, `testcontainers-postgresql`, `testcontainers-junit-jupiter`) — spins up a real PostgreSQL in Docker for the context test |
 
 ## Project Structure
@@ -409,9 +411,12 @@ spring.ai.ollama.base-url=${OLLAMA_URL:http://localhost:11434}
 spring.ai.ollama.chat.model=qwen2.5:7b
 spring.ai.ollama.chat.options.temperature=0.0
 spring.ai.ollama.init.pull-model-strategy=never
+spring.ai.retry.max-attempts=1
+spring.ai.ollama.read-timeout=60s
+spring.ai.ollama.connect-timeout=2s
 ```
 
-The `spring.ai.ollama.*` block is explained in [AI Integration](#ai-integration-spring-ai--ollama).
+The `spring.ai.*` block is explained in [AI Integration](#ai-integration-spring-ai--ollama).
 
 Connection settings are externalized as environment variables with `${VAR:default}` fallbacks, so no credentials need to be edited into the file to run locally, and the same build can be pointed at another database without a rebuild:
 
@@ -517,6 +522,9 @@ What the table shows:
 | `spring.ai.ollama.chat.model` | `qwen2.5:7b` | Qwen 2.5, 7.6B parameters, `Q4_K_M` quantization, about 4.7 GB on disk, 32k context. Upgraded from `qwen2.5:3b` (3.1B, ~1.9 GB) together with the search feature. |
 | `spring.ai.ollama.chat.options.temperature` | `0.0` | The model always picks the most likely token, so the same prompt gives (nearly) the same output. That suits extracting a filter, but as shown above it doesn't prevent wrong answers. |
 | `spring.ai.ollama.init.pull-model-strategy` | `never` | The app never downloads the model itself; it must already be present in Ollama. `never` is also Spring AI's default, so this line only makes the choice explicit. |
+| `spring.ai.retry.max-attempts` | `1` | A failed model call is not retried (the default is `10`). A search against a stopped Ollama now fails with `503` in about 2 s instead of ~19 minutes. |
+| `spring.ai.ollama.read-timeout` | `60s` | **Has no effect.** Spring AI 2.0.1 defines no such property (it is absent from the starter's configuration metadata), so Spring ignores it without a warning. |
+| `spring.ai.ollama.connect-timeout` | `2s` | **Has no effect**, for the same reason. |
 
 **Ollama in Docker Compose.** `docker-compose.yml` has a second service:
 
@@ -538,17 +546,31 @@ curl http://localhost:11434/api/tags                  # should list qwen2.5:7b
 
 A volume that only has the earlier `qwen2.5:3b` doesn't satisfy the new setting. Pull `qwen2.5:7b` as well (`ollama rm qwen2.5:3b` frees ~1.9 GB), or set `spring.ai.ollama.chat.model` back to `qwen2.5:3b`.
 
-> ⚠️ **A call to an unreachable Ollama blocks for about 19 minutes before failing, and this now happens inside an HTTP request.** Spring AI's retry defaults apply to every model call: `spring.ai.retry.max-attempts=10`, an initial back-off of 2 s multiplied by 5 each time, capped at 3 minutes. That is nine waits, roughly 1,140 s, before `QueryParsingException` turns the failure into a `503`. Checked with `GET /clients/1/transactions/search?q=everything` on an instance with `OLLAMA_URL` pointed at a closed port: the log showed `Retry error. Retry count:1`, `2` and `3` at +2 s, +12 s and +62 s, and the HTTP client gave up at 75 s without receiving any response. The server thread keeps retrying after the client disconnects. Lowering `spring.ai.retry.max-attempts` and `spring.ai.retry.backoff.max-interval` would bring this down to a few seconds.
+> ⚠️ **Retries are off, but the timeouts are not what the properties say.** `spring.ai.retry.max-attempts=1` works: the log shows a single `Retry error. Retry count:1` and the request returns `503` straight away. The two `spring.ai.ollama.*-timeout` lines do nothing, so the Ollama HTTP client (Reactor Netty) keeps its own defaults: a 30 s connect timeout and **no read timeout**. Measured on 2026-09-17 with `GET /clients/1/transactions/search?q=everything`:
+>
+> | Ollama at `OLLAMA_URL` | Result |
+> |---|---|
+> | Nothing listening (connection refused) | `503` after 2.3 s |
+> | Unroutable address (`10.255.255.1`) | `503` after 62 s — `connection timed out after 30000 ms` |
+> | Accepts the connection but never answers (a hung or overloaded Ollama) | **no response after 400 s**; the request thread stays blocked |
+>
+> Spring Boot's own `spring.http.clients.connect-timeout` and `spring.http.clients.read-timeout` do reach this client. Rerunning the last two cases with `connect-timeout=2s` and `read-timeout=5s` gave a `503` after 6.3 s (`connection timed out after 2000 ms`) and after 12.3 s (`ReadTimeoutException`). Those properties apply to every HTTP client Spring Boot auto-configures, not only to Ollama. A read timeout must also stay above the slowest real call (29 s for the first query while the model loads).
 
-## Running the App
-
-**Prerequisites**
+## Prerequisites
 
 - JDK 21
-- A PostgreSQL server with a `banking` database, reachable with the settings in [Configuration](#configuration) (defaults: `localhost:5432`, user `postgres`, password `postgres`). The bundled Docker Compose file provides exactly that — see below.
-- No global Maven install required — use the bundled wrapper
-- Docker is needed for the Compose database and for the tests (see [Testing](#testing)), but not to run the app itself against an existing PostgreSQL
-- Ollama with `qwen2.5:7b` pulled is needed **only for `GET /clients/{id}/transactions/search`**. The app starts without it, and every other endpoint works without it (see [AI Integration](#ai-integration-spring-ai--ollama))
+- Docker
+
+The AI-powered search endpoint additionally needs the model to be pulled once:
+
+```bash
+docker compose up -d
+docker compose exec ollama ollama pull qwen2.5:7b
+```
+
+This downloads about 4.7 GB. Every other endpoint works without it.
+
+## Running the App
 
 ### Starting PostgreSQL with Docker Compose
 
@@ -909,7 +931,7 @@ Expect **10–30 s per request** with the Compose container on a CPU. The first 
 |---|---|---|
 | `q` missing | `400 Bad Request` | Spring Boot's default error JSON, `{"timestamp":…,"status":400,"error":"Bad Request","path":…}`, served as `application/json`, **not** a problem document |
 | `q` present but empty (`?q=`) | `503 Service Unavailable` | title `Search unavailable`, detail `Could not interpret the search query` — a client mistake reported as an outage |
-| Ollama unreachable, or the model's reply can't be parsed | `503 Service Unavailable` | same body; when Ollama is unreachable it arrives only after ~19 minutes of retries |
+| Ollama unreachable, or the model's reply can't be parsed | `503 Service Unavailable` | same body; after ~2 s if nothing listens on the Ollama port, 62 s for an unroutable host, and **never** if Ollama accepts the connection but doesn't answer (no read timeout — see [AI Integration](#ai-integration-spring-ai--ollama)) |
 | Client unknown or closed | `404 Not Found` | title `Client not found`; returned only **after** the model call has finished |
 
 ### `POST /clients/transfer`
@@ -944,6 +966,49 @@ to.deposit(request.amount());
 ```
 
 The whole transfer runs inside a single `@Transactional` service method, so if `withdraw` throws, the transaction rolls back and neither balance is modified. Both accounts are also row-locked for the duration of the transaction, in a fixed order that rules out deadlocks — see [Concurrency](#concurrency).
+
+## AI-powered transaction search
+
+`GET /clients/{id}/transactions/search?q={natural language query}`
+
+Turns a plain-language request into a typed filter and applies it to the client's transfer history.
+
+| Query | Interpreted as |
+|---|---|
+| `transfers over 1000` | `minAmount=1000` |
+| `small payments under 50` | `maxAmount=50` |
+| `transfers with client 3` | `counterpartyId=3` |
+| `transfers in the last week` | a date range covering the last seven days |
+| `big transfers over 500 in the last month` | `minAmount=500` plus a one-month date range |
+| `everything` | no filters |
+
+Try it:
+
+```bash
+curl "http://localhost:8080/clients/1/transactions/search?q=transfers%20over%201000"
+```
+
+```bash
+curl "http://localhost:8080/clients/1/transactions/search?q=big%20transfers%20over%20500%20in%20the%20last%20month"
+```
+
+Returns `503 Service Unavailable` when the model is unreachable or the query cannot be interpreted. Every other endpoint keeps working.
+
+Every row in the table above was checked against `qwen2.5:7b` on 2026-09-17 by reading the parser's log line. On that run, "in the last month" became `from=2026-08-17, to=2026-09-17` (a rolling month), while the older example "big transfers last month" had given the previous calendar month. A query the model gets wrong is not an error, though: it returns `200` with the wrong filter applied. See [AI Integration](#ai-integration-spring-ai--ollama) for measured failures and timings.
+
+### Why a local model
+
+The model runs in a container next to the application; no request data leaves the machine. For a financial domain this is a deliberate architectural boundary rather than a cost decision — today the prompt carries only the user's phrase, but keeping inference local means no future change can leak account data to a third party by accident.
+
+Spring AI abstracts the provider, so switching to a hosted model (OpenAI, Anthropic, Gemini) is a dependency swap plus two properties — the application code does not change.
+
+### How it works
+
+1. The controller passes the raw query string to `TransactionQueryParser`.
+2. Spring AI derives a JSON schema from the `TransactionFilter` record, sends it alongside the prompt, and maps the model's response back into the record.
+3. The filter is applied to the history of the client taken **from the path**, never from the model output — the model narrows results within an already-authorised scope and cannot widen access.
+
+Parsing is deterministic (`temperature=0`) and every parsed query is logged.
 
 ## Error Handling
 
@@ -1028,16 +1093,16 @@ Since every transfer takes the lower id first, no cycle can form.
 
 **Requirements:** a running Docker daemon. You do *not* need a local PostgreSQL — the Testcontainers-backed tests start their own throwaway `postgres:16-alpine` containers, so `./mvnw test` is self-contained and safe to run against a machine with no `banking` database (and it never touches your local data).
 
-Current state: **25 tests, all passing** (15 unit, 4 controller-slice, 5 integration, 1 context).
+Current state: **28 tests, all passing** (16 unit, 6 controller-slice, 5 integration, 1 context).
 
 | Test class | Type | Coverage |
 |---|---|---|
 | `BankingApplicationTests` | Integration (`@SpringBootTest` + `@Testcontainers`) | `contextLoads()` — boots the full application context against a disposable PostgreSQL container. Because startup runs Flyway and then `ddl-auto=validate`, this single test transitively proves that **V1→V6 apply cleanly to an empty database** and that the resulting schema **matches the `Client` entity**. |
-| `service.ClientServiceTest` | Unit (Mockito-mocked `ClientRepository`, no DB) | `getAllClients` (mapping, size); `getClientById` plus its `ClientNotFoundException` path; `updatePhoneNumber`; `updateLastName`; `updateClient`; `createClient` (returns the saved client's id and mapped fields); `transfer` — happy path, same-account and insufficient-funds cases, and `transfer_savesTransactionRecord`, which verifies a `Transaction` is passed to `transactionRepository.save(...)`; `closeClient` with a zero and a non-zero balance. Balance assertions use AssertJ's `isEqualByComparingTo` (scale-independent `BigDecimal` comparison) rather than `isEqualTo`. |
+| `service.ClientServiceTest` | Unit (Mockito-mocked `ClientRepository`, no DB) | `getAllClients` (mapping, size); `getClientById` plus its `ClientNotFoundException` path; `updatePhoneNumber`; `updateLastName`; `updateClient`; `createClient` (returns the saved client's id and mapped fields); `transfer` — happy path, same-account and insufficient-funds cases, and `transfer_savesTransactionRecord`, which verifies a `Transaction` is passed to `transactionRepository.save(...)`; `closeClient` with a zero and a non-zero balance; `searchTransactions_whenFilterIsEmpty_usesWideDefaults`, which passes an all-`null` `TransactionFilter` and checks that `transactionRepository.search(...)` gets `minAmount = 0` and the client's own id as `counterpartyId` (the upper amount bound and both instants are only matched with `any(...)`). Balance assertions use AssertJ's `isEqualByComparingTo` (scale-independent `BigDecimal` comparison) rather than `isEqualTo`. |
 | `service.ClientServiceIntegrationTest` | Integration (`@SpringBootTest` + `@Testcontainers`) | Drives the real `ClientService` against a real database: a transfer moves money and **both balances survive the commit**; a failed transfer (insufficient funds) **leaves both balances unchanged**, proving the rollback; closing a client (after draining its balance) **removes it from the listing and makes it read as not-found**; a transfer `1 → 2` **appears at the top of client 1's history** with the right ids, amount, a non-null `createdAt` and a resolved `fromName`, and shows up in client 2's history too; and `getClientHistory` for an unknown id throws `ClientNotFoundException`. |
-| `controller.ClientControllerTest` | Web slice (`@WebMvcTest(ClientController.class)` + `@MockitoBean` service and query parser) | Exercises the HTTP layer with MockMvc and no database: `404` + problem-document `status`/`detail` for an unknown id; `400` with `errors.amount` for a negative amount; `400` with `errors.{fromId,toId,amount}` for an empty body; `409` when the service reports insufficient funds. |
+| `controller.ClientControllerTest` | Web slice (`@WebMvcTest(ClientController.class)` + `@MockitoBean` service and query parser) | Exercises the HTTP layer with MockMvc and no database: `404` + problem-document `status`/`detail` for an unknown id; `400` with `errors.amount` for a negative amount; `400` with `errors.{fromId,toId,amount}` for an empty body; `409` when the service reports insufficient funds; `searchTransactions_passesParsedFilterToService` (the stubbed parser's `TransactionFilter` reaches `clientService.searchTransactions`, and the result is returned as a `200` array); `searchTransactions_whenParsingFails_returns503` (a `QueryParsingException` from the parser becomes a `503` problem document). |
 
-`ClientControllerTest` now also declares `@MockitoBean TransactionQueryParser`. `@WebMvcTest` doesn't pick up `@Component` classes, and the controller's constructor now needs the parser, so the slice can't create the controller without that mock. No test gives the mock any behavior yet.
+`ClientControllerTest` now also declares `@MockitoBean TransactionQueryParser`. `@WebMvcTest` doesn't pick up `@Component` classes, and the controller's constructor now needs the parser, so the slice can't create the controller without that mock. The two search tests stub it, so they cover the HTTP contract without Ollama.
 
 Test methods follow a `method_whenCondition_expectedBehavior` naming convention (e.g. `transfer_whenInsufficientFunds_throwsInsufficientFunds`).
 
@@ -1072,7 +1137,7 @@ class BankingApplicationTests {
 
 **Remaining gaps**
 
-- **The search feature has no tests at any layer.** Nothing covers `TransactionRepository.search`, the default bounds in `ClientService.searchTransactions`, `TransactionQueryParser`, the `GET /clients/{id}/transactions/search` mapping, or the `503` from `QueryParsingException`. The earlier version of the query failed on every call without the suite noticing; this rewrite works only because it was checked by hand. An integration test calling `searchTransactions` with an all-`null` `TransactionFilter` and one test per filter would protect the query. A `@WebMvcTest` that stubs the parser would cover the HTTP contract without needing Ollama.
+- **Search is only partly tested.** The controller mapping, the `503` from `QueryParsingException`, and the `minAmount`/`counterpartyId` defaults in `ClientService.searchTransactions` are now covered. Still untested: `TransactionRepository.search` against a real database (the earlier version of this query failed on every call and the suite didn't notice), the `maxAmount`/date defaults (matched only with `any(...)`), `TransactionQueryParser` itself, a missing or empty `q`, and a search for an unknown client. An integration test calling `searchTransactions` with an all-`null` filter and then one test per filter would protect the query.
 - **`GET /clients/{id}/transactions` has no controller-slice test.** The service method is covered by integration tests, but nothing asserts the HTTP mapping — the `200` array shape or the `404` problem document.
 - **The history tests are shallow in places.** `transfer_savesTransactionRecord` matches `any(Transaction.class)`, so it would pass if the wrong parties, amount or type were recorded; the integration test's two `isNotEmpty()` checks on the histories of clients 1 and 2 are now **always true before the transfer even happens**, because `V6` seeds both — so they no longer prove anything, and only the `getFirst()` assertions on client 1's history test the new row; and there is no unit test for `getClientHistory` or for the `TransactionResponse` mapping (including the `null` last-name case). The integration test's `getFirst()` check is reliable despite the shared database only because the test's own transfer is the most recent one.
 - **No test covers history for a closed client** — neither the `404` on its own history nor its transfers remaining visible to a counterparty.
@@ -1106,7 +1171,7 @@ steps:
 | Dependency cache | `cache: maven` — `setup-java` caches `~/.m2/repository`, keyed on the POM |
 | Command | `./mvnw --batch-mode verify` |
 
-`verify` runs the full lifecycle up to and including packaging, so CI compiles, executes all 25 tests, builds the jar, and repackages it as a Spring Boot executable archive — a stricter gate than `test` alone.
+`verify` runs the full lifecycle up to and including packaging, so CI compiles, executes all 28 tests, builds the jar, and repackages it as a Spring Boot executable archive — a stricter gate than `test` alone.
 
 Two details make this work without extra setup:
 
@@ -1133,7 +1198,7 @@ Two details make this work without extra setup:
 - **`createClient`'s test doesn't verify the saved entity**: it stubs `repository.save(any(Client.class))` and only checks the returned `ClientResponse`, so a bug that dropped a field before calling `save` (e.g. forgetting to copy `phoneNumber`) wouldn't be caught. `POST /clients` also has no controller-slice or integration coverage, so its `201` and `Location` header are untested (see [Testing](#testing)).
 - **Search results can be silently wrong**: `GET /clients/{id}/transactions/search` trusts whatever filter the model returns. In testing, the model added a date nobody asked for ("transfers between 100 and 500" → 1 row instead of 16), mapped a name to the wrong client id ("with Jane" → client 3's transfers), and answered "hello" with last week's history. Every one of those was a `200`, and the response doesn't include the filter that was applied (see [AI Integration](#ai-integration-spring-ai--ollama)). Returning the parsed filter with the results, or checking it against the query, would make these mistakes visible.
 - **Search can't understand client names**: the model has no access to client data, so "transfers with Jane" can only become a guessed `counterpartyId`. Only "with client 2" style queries work reliably.
-- **Search is slow and costly per request**: each call spends about 12–17 s of CPU on a 7.6B model (29 s on the first call), holding a request thread the whole time. There is no timeout, caching, rate limit or authentication in front of it, so nothing limits how many of these requests run at once.
+- **Search is slow and costly per request**: each call spends about 12–17 s of CPU on a 7.6B model (29 s on the first call), holding a request thread the whole time. There is no working read timeout, caching, rate limit or authentication in front of it, so nothing limits how many of these requests run at once.
 - **Search status codes are misleading at the edges**: an empty `q` returns `503 Search unavailable` although it is a client error; a missing `q` returns `400` in Spring Boot's default body rather than a problem document; and because the model is called before the client lookup, an unknown id takes seconds to get its `404`, and gets `503` instead if Ollama is down.
 - **Search edge cases remain**: naming the client as its own `counterpartyId` returns the full history rather than nothing (and is exactly how a missing counterparty is implemented); date filters use UTC calendar days while the prompt's "today" uses the server's zone; inverted amount or date ranges silently return `[]`; a `null` filter throws `NullPointerException`; and `TransactionFilter` has no validation.
 - **Raw search text is logged**: every query is written at `INFO` (and at `WARN` with a stack trace on failure). The text is whatever the user typed, which may include personal details.
@@ -1148,7 +1213,7 @@ Two details make this work without extra setup:
 - **Closing is irreversible and retains all personal data**: `close()` is one-way — no endpoint reopens an account — and the soft delete keeps the name and phone number in the `client` table indefinitely. For an API holding personal data that is a retention decision worth making deliberately, and it means `DELETE /clients/{id}` does *not* satisfy a request to erase someone's data.
 - **`DELETE /clients/{id}` is not idempotent**: repeating it returns `404` rather than `204`, because a closed client is indistinguishable from a missing one (see [API Reference](#delete-clientsid)).
 - **Spring AI auto-configures more than is used**: only `ChatClient.Builder` is used (by `TransactionQueryParser`), but every context also gets an embedding model, chat memory and tool-calling beans.
-- **Search hangs for ~19 minutes when Ollama is unavailable**: Spring AI's default retry (10 attempts, back-off up to 3 minutes) runs on the request thread, so each search holds a Tomcat thread that long before returning `503`, and keeps it busy even after the client disconnects. Verified for the first 75 s (see [AI Integration](#ai-integration-spring-ai--ollama)).
+- **The Ollama timeout properties are ignored**: `spring.ai.ollama.read-timeout` and `spring.ai.ollama.connect-timeout` don't exist in Spring AI 2.0.1, so a search waits 30 s per connect attempt (62 s in total, measured) for an unreachable host, and **forever** for an Ollama that accepts the connection but doesn't answer. Turning off retries (`max-attempts=1`) did fix the old ~19-minute wait when nothing is listening. Replacing the two lines with `spring.http.clients.connect-timeout` / `spring.http.clients.read-timeout` was verified to work, but those settings apply to all auto-configured HTTP clients (see [AI Integration](#ai-integration-spring-ai--ollama)).
 - **The model is not provisioned automatically**: `pull-model-strategy=never` and the Compose service has no init step, so on a fresh volume every search returns `503` until someone runs `ollama pull qwen2.5:7b` (~4.7 GB) by hand. A volume that only has `qwen2.5:3b` from the previous setting has the same problem.
 - **`ollama/ollama:latest` is unpinned**: unlike `postgres:16-alpine`, the Ollama image floats, so two developers (or two days) can run different server versions. The Ollama service also has no healthcheck, so `docker compose ps` can't say when it is ready.
 - **Ollama runs on CPU in Docker Desktop for macOS**: containers there cannot use the Mac GPU, so the model is slower in `banking-ollama` than in the native Ollama app — which, if installed, also competes for port `11434`. The 12–17 s search times measured above were taken under these conditions.
