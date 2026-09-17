@@ -62,7 +62,7 @@ src/main/java/com/roladio/banking
 │   ├── PhoneNumberRequest.java  # PATCH .../phoneNumber body
 │   ├── TransferRequest.java     # POST /clients/transfer body
 │   ├── TransactionFilter.java   # optional history search criteria; produced by the LLM, never bound from HTTP
-│   └── TransactionResponse.java # one entry in GET /clients/{id}/transactions
+│   └── TransactionResponse.java # one entry in GET /clients/{id}/transactions, and what the MCP searchTransactions tool returns
 ├── exceptions/
 │   ├── ClientNotFoundException.java     # unchecked; carries "Client not found: <id>" -> 404
 │   ├── InsufficientFundsException.java  # unchecked; carries "Insufficient funds" -> 409
@@ -484,6 +484,8 @@ The MCP server added alongside it points the other way: there the *client* is th
 | `chatMemory` | `MessageWindowChatMemory` over an `InMemoryChatMemoryRepository` — unused |
 | `toolCallingManager` | `DefaultToolCallingManager` — unused |
 
+The MCP server starter adds a second set on top — `McpServerAutoConfiguration`, `ToolCallbackConverterAutoConfiguration`, the annotation scanner, and the WebMVC transports (`McpServerStreamableHttpWebMvcAutoConfiguration` among them) — and it is those, not anything in the Ollama half, that turn `McpConfig`'s `ToolCallbackProvider` into a live endpoint. The two halves of Spring AI in this project share only the BOM.
+
 Creating these beans, and building the parser's `ChatClient`, makes **no network call**. The application therefore starts without an Ollama server; only a search request needs one. Verified by starting the app with `OLLAMA_URL` pointed at a closed port. No test calls the model (the controller slice mocks the parser), so the suite and CI still need no Ollama.
 
 ### `TransactionQueryParser` (`ai/TransactionQueryParser.java`)
@@ -581,7 +583,7 @@ docker compose up -d
 docker compose exec ollama ollama pull qwen2.5:7b
 ```
 
-This downloads about 4.7 GB. Every other endpoint works without it.
+This downloads about 4.7 GB. Every other endpoint works without it — including the MCP server, which needs no model of its own, only the application running (see [MCP server](#mcp-server)).
 
 ## Running the App
 
@@ -886,6 +888,27 @@ curl http://localhost:8080/clients/1/transactions
 
 `direction` is relative to the client whose history is being read: the same transfer is `OUTGOING` for the sender and `INCOMING` for the recipient.
 
+Both values turn up in a single response. These are the two newest rows of client 3's history on a fresh database — `curl http://localhost:8080/clients/3/transactions` — with ids and amounts from the `V6` seed data (the timestamps depend on when the migration ran):
+
+```json
+[
+  {
+    "id": 100, "type": "TRANSFER", "direction": "OUTGOING",
+    "fromId": 3, "fromName": "Richard Miles",
+    "toId": 1, "toName": "John Doe",
+    "amount": 83.25, "createdAt": "2026-09-17T05:10:45.354415Z"
+  },
+  {
+    "id": 99, "type": "TRANSFER", "direction": "INCOMING",
+    "fromId": 1, "fromName": "John Doe",
+    "toId": 3, "toName": "Richard Miles",
+    "amount": 979.12, "createdAt": "2026-09-15T06:40:45.354415Z"
+  }
+]
+```
+
+Row 100 leaves client 3, row 99 arrives — and both rows read the other way round in client 1's history.
+
 On a fresh database clients 1, 2 and 3 return 68, 66 and 66 entries; client 4 returns `[]` until it takes part in a transfer.
 
 | Field | Notes |
@@ -1076,18 +1099,36 @@ This matters twice over here: the Spring AI MCP starters expose an **unauthentic
 
 The descriptions are part of the contract, not comments: they are what the agent reads to decide which tool to call.
 
+Nothing references that bean directly. The starter's `ToolCallbackConverterAutoConfiguration` collects **every** `ToolCallback` and `ToolCallbackProvider` bean in the context and converts them into MCP tool specifications while the context is building — so publishing another tool is a matter of adding a bean, and any `@Tool` method that reaches the context is exposed, whether or not that was intended.
+
+Two mistakes are therefore startup failures rather than runtime surprises: `MethodToolCallbackProvider`'s constructor builds the callbacks immediately, rejecting a tool object with no `@Tool` methods and any two tools sharing a name (`Multiple tools with the same name …`). The tool name defaults to the method name, which is where `listClients`, `getClient` and `searchTransactions` come from — renaming a method renames the tool.
+
+### Compared with the REST search endpoint
+
+`searchTransactions` is the name of both a tool and a REST route, and they are not the same thing. The tool takes the five filter fields directly and never calls `TransactionQueryParser`, so this path needs no Ollama at all — the connected agent is the model doing the interpreting, and usually a far larger one than the local `qwen2.5:7b`.
+
+That sidesteps one documented weakness. The REST search cannot resolve a client name, because the model it asks has no access to client data and can only guess an id (see [AI Integration](#ai-integration-spring-ai--ollama)). An MCP agent can call `listClients` first, read that Jane Roe is client 2, and then pass `counterpartyId=2` — so *"Jane's transfers over 1000"* is answerable here. Nothing forces it to look first, though; an agent is free to guess an id exactly as the local model does.
+
+Everything below the filter is unchanged, so the tool inherits the same semantics: whole UTC calendar days for `from`/`to`, inclusive amount bounds, and a `counterpartyId` equal to the client's own id meaning "no counterparty filter" (see [Searching history](#searching-history--transactionrepositorysearch)). The rows come back as the same `TransactionResponse` records the REST routes return, `direction` included, so an agent can tell money in from money out without comparing ids itself.
+
 ### Configuration
 
-The server is turned on by the `spring-ai-starter-mcp-server-webmvc` dependency plus four properties in `application.properties`:
+The server is switched on by the dependency alone — `spring.ai.mcp.server.enabled` defaults to `true`, as does its tool capability. The four properties in `application.properties` only describe it, and two of them restate a default:
 
-| Property | Value | Effect |
-|---|---|---|
-| `spring.ai.mcp.server.name` | `banking-api` | Server name reported during the MCP handshake |
-| `spring.ai.mcp.server.version` | `1.0.0` | Server version reported during the handshake |
-| `spring.ai.mcp.server.instructions` | `Read-only access to bank clients and their transfer history.` | Sent to the client as the server's own description of itself |
-| `spring.ai.mcp.server.protocol` | `STREAMABLE` | Selects Streamable-HTTP (the `/mcp` endpoint) rather than the older SSE transport |
+| Property | Value | Starter default | Effect |
+|---|---|---|---|
+| `spring.ai.mcp.server.name` | `banking-api` | `mcp-server` | Identifies the server to the connecting client and in logs |
+| `spring.ai.mcp.server.version` | `1.0.0` | `1.0.0` | Version reported to the client — **the same value the starter would use anyway** |
+| `spring.ai.mcp.server.instructions` | `Read-only access to bank clients and their transfer history.` | *(none)* | Guidance handed to the client on how to interact with this server; omitted from the handshake unless set |
+| `spring.ai.mcp.server.protocol` | `STREAMABLE` | `STREAMABLE` | Streamable-HTTP, rather than `SSE` (which serves `/sse` plus `/mcp/message`) or `STATELESS`. **Also the default** — the line documents the choice rather than making it |
 
-The tools reuse `ClientService` unchanged, so an MCP call runs exactly the same lookups, closed-client filtering and queries as the equivalent REST request, and raises the same exceptions — an unknown or closed id throws `ClientNotFoundException` inside the tool call, where there is no `@RestControllerAdvice` to turn it into a problem document. Note also that `searchTransactions` is the *tool*, taking the five filter fields directly; it does not call `TransactionQueryParser`, so the MCP path needs no Ollama at all — the connected agent is the model doing the interpreting.
+The endpoint path is a default too: `spring.ai.mcp.server.streamable-http.mcp-endpoint` is `/mcp` and is not set here. The server is synchronous unless `spring.ai.mcp.server.type` says otherwise, so a tool call occupies a request thread for its duration, exactly like a REST call.
+
+### Errors, and what the agent is told
+
+The tools reuse `ClientService` unchanged, so an MCP call runs exactly the same lookups, closed-client filtering and queries as the equivalent REST request, and raises the same exceptions. `GlobalExceptionHandler` does not apply, though — it is a `@RestControllerAdvice`, and the MCP endpoint is not a controller. Spring AI's own wrapper catches everything instead and answers with a tool result carrying `isError: true` and **the exception's message as its text**.
+
+So `getClient(99)` hands the agent the string `Client not found: 99` rather than a `404` problem document. That is convenient — the agent can read it and correct itself — but it means any exception message the application produces goes straight to the caller, including ones from unexpected failures that the REST layer would have flattened into a generic `500`.
 
 ## Error Handling
 
@@ -1120,6 +1161,8 @@ All custom exceptions are unchecked (`RuntimeException`) and build their own mes
 Any other unhandled exception (e.g. a database connectivity failure, a malformed JSON body, or a `DataIntegrityViolationException` from exceeding a column's length) falls through to Spring Boot's default error handling. Those responses are *also* `application/problem+json`, but carry Spring's generic title/detail rather than a domain-specific one.
 
 One exception to that has been observed: calling `GET /clients/{id}/transactions/search` without `q` returns `400` with Spring Boot's older error body (`timestamp`, `status`, `error`, `path`) as plain `application/json`. So a missing query parameter doesn't produce the same envelope as the other errors.
+
+None of this covers the MCP endpoint. `@RestControllerAdvice` applies to controller handlers, and `POST /mcp` is not one: the very same `ClientNotFoundException` becomes a JSON-RPC tool result flagged `isError` whose text is the exception's message, with no status code and no problem document anywhere (see [MCP server](#errors-and-what-the-agent-is-told)).
 
 ## Concurrency
 
@@ -1176,7 +1219,7 @@ Current state: **28 tests, all passing** (16 unit, 6 controller-slice, 5 integra
 
 | Test class | Type | Coverage |
 |---|---|---|
-| `BankingApplicationTests` | Integration (`@SpringBootTest` + `@Testcontainers`) | `contextLoads()` — boots the full application context against a disposable PostgreSQL container. Because startup runs Flyway and then `ddl-auto=validate`, this single test transitively proves that **V1→V6 apply cleanly to an empty database** and that the resulting schema **matches the `Client` entity**. It now also covers the MCP server starter: the context contains `BankingTools`, `McpConfig`'s `ToolCallbackProvider` and the auto-configured MCP endpoint, so a tool method Spring AI cannot build a schema for would fail this test at startup. |
+| `BankingApplicationTests` | Integration (`@SpringBootTest` + `@Testcontainers`) | `contextLoads()` — boots the full application context against a disposable PostgreSQL container. Because startup runs Flyway and then `ddl-auto=validate`, this single test transitively proves that **V1→V6 apply cleanly to an empty database** and that the resulting schema **matches the `Client` entity**. It now also covers the MCP server starter: the context contains `BankingTools`, `McpConfig`'s `ToolCallbackProvider` and the auto-configured MCP endpoint. Because `MethodToolCallbackProvider` builds and validates its callbacks in its constructor, and the starter converts them into tool specifications while the context builds, this test fails if a tool object has no `@Tool` method, if two tools share a name, or if a signature's JSON schema cannot be generated. It does **not** exercise a single tool call. |
 | `service.ClientServiceTest` | Unit (Mockito-mocked `ClientRepository`, no DB) | `getAllClients` (mapping, size); `getClientById` plus its `ClientNotFoundException` path; `updatePhoneNumber`; `updateLastName`; `updateClient`; `createClient` (returns the saved client's id and mapped fields); `transfer` — happy path, same-account and insufficient-funds cases, and `transfer_savesTransactionRecord`, which verifies a `Transaction` is passed to `transactionRepository.save(...)`; `closeClient` with a zero and a non-zero balance; `searchTransactions_whenFilterIsEmpty_usesWideDefaults`, which passes an all-`null` `TransactionFilter` and checks that `transactionRepository.search(...)` gets `minAmount = 0` and the client's own id as `counterpartyId` (the upper amount bound and both instants are only matched with `any(...)`). Balance assertions use AssertJ's `isEqualByComparingTo` (scale-independent `BigDecimal` comparison) rather than `isEqualTo`. |
 | `service.ClientServiceIntegrationTest` | Integration (`@SpringBootTest` + `@Testcontainers`) | Drives the real `ClientService` against a real database: a transfer moves money and **both balances survive the commit**; a failed transfer (insufficient funds) **leaves both balances unchanged**, proving the rollback; closing a client (after draining its balance) **removes it from the listing and makes it read as not-found**; a transfer `1 → 2` **appears at the top of client 1's history** with the right ids, amount, a non-null `createdAt` and a resolved `fromName`, and shows up in client 2's history too — the same row, matched by `id`, reading `OUTGOING` for client 1 and `INCOMING` for client 2, which is the only test of the per-reader `direction`; and `getClientHistory` for an unknown id throws `ClientNotFoundException`. |
 | `controller.ClientControllerTest` | Web slice (`@WebMvcTest(ClientController.class)` + `@MockitoBean` service and query parser) | Exercises the HTTP layer with MockMvc and no database: `404` + problem-document `status`/`detail` for an unknown id; `400` with `errors.amount` for a negative amount; `400` with `errors.{fromId,toId,amount}` for an empty body; `409` when the service reports insufficient funds; `searchTransactions_passesParsedFilterToService` (the stubbed parser's `TransactionFilter` reaches `clientService.searchTransactions`, and the result is returned as a `200` array, with `$[0].direction` asserted to serialize as `"OUTGOING"`); `searchTransactions_whenParsingFails_returns503` (a `QueryParsingException` from the parser becomes a `503` problem document). |
@@ -1277,7 +1320,7 @@ Two details make this work without extra setup:
 - **`updateClient_updatesAllFields` is now misnamed**: it no longer asserts anything about balance, because the endpoint no longer changes it — the name promises more than the test checks.
 - **`createClient`'s test doesn't verify the saved entity**: it stubs `repository.save(any(Client.class))` and only checks the returned `ClientResponse`, so a bug that dropped a field before calling `save` (e.g. forgetting to copy `phoneNumber`) wouldn't be caught. `POST /clients` also has no controller-slice or integration coverage, so its `201` and `Location` header are untested (see [Testing](#testing)).
 - **Search results can be silently wrong**: `GET /clients/{id}/transactions/search` trusts whatever filter the model returns. In testing, the model added a date nobody asked for ("transfers between 100 and 500" → 1 row instead of 16), mapped a name to the wrong client id ("with Jane" → client 3's transfers), and answered "hello" with last week's history. Every one of those was a `200`, and the response doesn't include the filter that was applied (see [AI Integration](#ai-integration-spring-ai--ollama)). Returning the parsed filter with the results, or checking it against the query, would make these mistakes visible.
-- **Search can't understand client names**: the model has no access to client data, so "transfers with Jane" can only become a guessed `counterpartyId`. Only "with client 2" style queries work reliably.
+- **Search can't understand client names**: the model has no access to client data, so "transfers with Jane" can only become a guessed `counterpartyId`. Only "with client 2" style queries work reliably. This is a limitation of the REST route specifically — an MCP agent can call `listClients` to resolve the name itself before filtering (see [MCP server](#compared-with-the-rest-search-endpoint)), which is the clearest argument for the tools being the better interface of the two.
 - **Search is slow and costly per request**: each call spends about 12–17 s of CPU on a 7.6B model (29 s on the first call), holding a request thread the whole time. There is no working read timeout, caching, rate limit or authentication in front of it, so nothing limits how many of these requests run at once.
 - **Search status codes are misleading at the edges**: an empty `q` returns `503 Search unavailable` although it is a client error; a missing `q` returns `400` in Spring Boot's default body rather than a problem document; and because the model is called before the client lookup, an unknown id takes seconds to get its `404`, and gets `503` instead if Ollama is down.
 - **Search edge cases remain**: naming the client as its own `counterpartyId` returns the full history rather than nothing (and is exactly how a missing counterparty is implemented); date filters use UTC calendar days while the prompt's "today" uses the server's zone; inverted amount or date ranges silently return `[]`; a `null` filter throws `NullPointerException`; and `TransactionFilter` has no validation.
@@ -1292,9 +1335,10 @@ Two details make this work without extra setup:
 - **Transaction history is unbounded**: `findHistoryForClient` returns every row for a client with no paging or limit, and `GET /clients/{id}/transactions` serializes the whole list, so a long-lived account loads and sends its entire ledger in one response. Combined with the unindexed query above and the lack of authentication, this is also the cheapest endpoint to make expensive.
 - **Closing is irreversible and retains all personal data**: `close()` is one-way — no endpoint reopens an account — and the soft delete keeps the name and phone number in the `client` table indefinitely. For an API holding personal data that is a retention decision worth making deliberately, and it means `DELETE /clients/{id}` does *not* satisfy a request to erase someone's data.
 - **`DELETE /clients/{id}` is not idempotent**: repeating it returns `404` rather than `204`, because a closed client is indistinguishable from a missing one (see [API Reference](#delete-clientsid)).
-- **Spring AI auto-configures more than is used**: only `ChatClient.Builder` is used (by `TransactionQueryParser`), but every context also gets an embedding model, chat memory and tool-calling beans.
+- **Spring AI auto-configures more than is used**: two beans are actually consumed — `ChatClient.Builder` by `TransactionQueryParser`, and `McpConfig`'s `ToolCallbackProvider` by the MCP starter's converter — while every context still also gets an `OllamaEmbeddingModel` (though nothing configures an embedding model), chat memory and a `ToolCallingManager`, none of which anything touches. The MCP server brings its own auto-configurations on top, including an annotation scanner for `@McpTool`-style beans that this project does not use.
 - **The MCP tools inherit every limit of the queries behind them**: `listClients` returns every open client and `searchTransactions` returns a client's whole unpaged history in one result, straight into the agent's context — on the unindexed query described above (see [Data Model](#reading-history--transactionrepository)). There is no limit, paging or rate limit on the tool side either, so an agent that asks for a busy account's full history pays for all of it.
 - **`searchTransactions` is one name for two different things**: the MCP tool takes the five filter fields directly, while the REST route of the same name takes free text and asks Ollama to produce them. They share `ClientService.searchTransactions` but not their input contract, which is worth remembering when reading logs or stack traces.
+- **Tool errors hand the caller the raw exception message**: Spring AI wraps each tool call in a `catch (Exception e)` and returns `e.getMessage()` to the client as an error result. `ClientNotFoundException` is fine that way — `Client not found: 99` is exactly what an agent needs — but an unexpected failure (a constraint violation, a connection error) sends its message out over an unauthenticated endpoint, where the REST layer would have returned a generic `500`. Nothing filters or maps those messages.
 - **Tool descriptions are untested contract**: the `@Tool`/`@ToolParam` text is what the agent reads to choose a tool and fill its arguments, so editing a description changes behaviour as surely as editing code — and nothing in the suite notices (see [Testing](#testing)).
 - **The Ollama timeout properties are ignored**: `spring.ai.ollama.read-timeout` and `spring.ai.ollama.connect-timeout` don't exist in Spring AI 2.0.1, so a search waits 30 s per connect attempt (62 s in total, measured) for an unreachable host, and **forever** for an Ollama that accepts the connection but doesn't answer. Turning off retries (`max-attempts=1`) did fix the old ~19-minute wait when nothing is listening. Replacing the two lines with `spring.http.clients.connect-timeout` / `spring.http.clients.read-timeout` was verified to work, but those settings apply to all auto-configured HTTP clients (see [AI Integration](#ai-integration-spring-ai--ollama)).
 - **The model is not provisioned automatically**: `pull-model-strategy=never` and the Compose service has no init step, so on a fresh volume every search returns `503` until someone runs `ollama pull qwen2.5:7b` (~4.7 GB) by hand. A volume that only has `qwen2.5:3b` from the previous setting has the same problem.
