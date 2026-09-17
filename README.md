@@ -57,7 +57,9 @@ src/main/java/com/roladio/banking
 │   ├── ClientHasBalanceException.java   # unchecked; blocks closing a funded account -> 409
 │   └── GlobalExceptionHandler.java      # @RestControllerAdvice mapping exceptions -> HTTP status
 ├── model/
-│   └── Client.java               # JPA entity mapped to the `client` table
+│   ├── Client.java               # JPA entity mapped to the `client` table
+│   ├── Transaction.java          # JPA entity for `transaction` — mapped, nothing writes it yet
+│   └── TransactionType.java      # enum, currently just TRANSFER
 ├── repository/
 │   └── ClientRepository.java     # JpaRepository + row-locking and closed-filtering lookups
 └── service/
@@ -154,9 +156,30 @@ The consequence is that a closed client becomes indistinguishable from a non-exi
 
 `spring.jpa.hibernate.ddl-auto=validate` (see [Configuration](#configuration)) means Hibernate only checks this table matches the `Client` entity at startup — it never creates or alters it. Flyway owns the schema entirely.
 
-### `transaction` table — schema only, not yet used
+### `Transaction` entity (`model/Transaction.java`) — mapped, not yet written
 
-`V5` creates a table to record money movements. **No Java code reads or writes it yet**: there is no `Transaction` entity, no repository, and `transfer` does not insert a row. Transfers currently leave no audit trail, and this table stays empty.
+`V5` creates a table to record money movements, and `Transaction` maps to it. **Nothing writes to it yet**: there is no repository and `transfer` does not create a row, so the table stays empty and transfers still leave no audit trail.
+
+| Field | Java type | Column | Notes |
+|---|---|---|---|
+| `id` | `Long` | `id` | `@GeneratedValue(IDENTITY)` |
+| `type` | `TransactionType` | `type` | `@Enumerated(EnumType.STRING)`, so the enum name is stored as text. The enum currently has a single constant, `TRANSFER`. |
+| `from` | `Client` | `from_id` | `@ManyToOne(fetch = LAZY)` |
+| `to` | `Client` | `to_id` | `@ManyToOne(fetch = LAZY)` |
+| `amount` | `BigDecimal` | `amount` | |
+| `createdAt` | `Instant` | `created_at` | `insertable = false, updatable = false` — the database's `DEFAULT now()` owns this value |
+
+The entity is read-only from the outside: Lombok generates getters but no setters, and rows are built through a static factory that fixes the type:
+
+```java
+public static Transaction transfer(Client from, Client to, BigDecimal amount) {
+    return new Transaction(null, TransactionType.TRANSFER, from, to, amount, null);
+}
+```
+
+Storing `type` as `EnumType.STRING` rather than `ORDINAL` is what makes the column readable and stable — adding or reordering enum constants can't silently reinterpret existing rows.
+
+> ⚠️ **`createdAt` is `null` on a freshly persisted instance.** Because the column is `insertable = false`, Hibernate omits it from the `INSERT` and does not read it back, so the value exists in the database but not on the object in memory. Verified against a real database: after `persist` + `flush` the entity has its generated `id` but `createdAt == null`; only after `em.refresh(...)` does it populate. If a future endpoint returns a transaction straight after creating it, annotate the field with Hibernate's `@Generated(event = INSERT)` so the value is selected back automatically.
 
 | Column | Type | Constraints |
 |---|---|---|
@@ -186,7 +209,7 @@ Flyway migrations live in `src/main/resources/db/migration` and run automaticall
 | V2 | `V2__insert_seed_clients.sql` | Seeds 4 sample rows into `client`. |
 | V3 | `V3__update_seed_clients.sql` | Overwrites the first/last name and phone number of the 4 seeded rows (ids 1–4) with different sample data (`John Doe`, `Jane Roe`, `Richard Miles`, `Mary Major`) — balances from `V2` are untouched. |
 | V4 | `V4__add_closed_to_client.sql` | Adds the `closed BOOLEAN NOT NULL DEFAULT FALSE` soft-delete flag; the default leaves every existing row open. |
-| V5 | `V5__create_transaction_table.sql` | Creates the `transaction` table with FKs to `client` and indexes on both sides. Schema only — **no application code writes to it yet** (see [Data Model](#transaction-table--schema-only-not-yet-used)). |
+| V5 | `V5__create_transaction_table.sql` | Creates the `transaction` table with FKs to `client` and indexes on both sides. Mapped by the `Transaction` entity, but **nothing writes to it yet** (see [Data Model](#transaction-entity-modeltransactionjava--mapped-not-yet-written)). |
 
 **`V2` inserts, then `V3` overwrites names/phone numbers on top — net result after both run:**
 
@@ -752,7 +775,7 @@ Two details make this work without extra setup:
 - **`ClientRequest` serves two endpoints with different semantics**: `balance` seeds the opening balance on `POST /clients`, but is required-and-ignored on `PUT /clients/{id}` (see [API Reference](#put-clientsid)). Splitting it into `CreateClientRequest` / `UpdateClientRequest` would make both contracts honest.
 - **`updateClient_updatesAllFields` is now misnamed**: it no longer asserts anything about balance, because the endpoint no longer changes it — the name promises more than the test checks.
 - **`createClient`'s test doesn't verify the saved entity**: it stubs `repository.save(any(Client.class))` and only checks the returned `ClientResponse`, so a bug that dropped a field before calling `save` (e.g. forgetting to copy `phoneNumber`) wouldn't be caught. `POST /clients` also has no controller-slice or integration coverage, so its `201` and `Location` header are untested (see [Testing](#testing)).
-- **Transfers leave no audit trail**: `V5` creates a `transaction` table, but nothing maps to it — no entity, no repository, no insert in `transfer`, and no endpoint to read history. Balances move with no record of why, so a disputed transfer cannot be reconstructed. The schema is in place; the wiring is not (see [Data Model](#transaction-table--schema-only-not-yet-used)).
+- **Transfers still leave no audit trail**: the `transaction` table and its `Transaction` entity both exist, but there is no repository, no insert in `transfer`, and no endpoint to read history. Balances move with no record of why, so a disputed transfer cannot be reconstructed. Schema and mapping are in place; the write path is not (see [Data Model](#transaction-entity-modeltransactionjava--mapped-not-yet-written)).
 - **Closing is irreversible and retains all personal data**: `close()` is one-way — no endpoint reopens an account — and the soft delete keeps the name and phone number in the `client` table indefinitely. For an API holding personal data that is a retention decision worth making deliberately, and it means `DELETE /clients/{id}` does *not* satisfy a request to erase someone's data.
 - **`DELETE /clients/{id}` is not idempotent**: repeating it returns `404` rather than `204`, because a closed client is indistinguishable from a missing one (see [API Reference](#delete-clientsid)).
 - **No authentication/authorization**: every endpoint is unauthenticated and unauthorized — anyone who can reach port 8080 can read all client data and move money between any two accounts.
