@@ -3,7 +3,9 @@ package com.roladio.banking.service;
 import com.roladio.banking.dto.*;
 import com.roladio.banking.exceptions.ClientNotFoundException;
 import com.roladio.banking.model.Client;
+import com.roladio.banking.model.Transaction;
 import com.roladio.banking.repository.ClientRepository;
+import com.roladio.banking.repository.TransactionRepository;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -14,9 +16,11 @@ import java.util.stream.Collectors;
 public class ClientService {
 
     private final ClientRepository clientRepository;
+    private final TransactionRepository transactionRepository;
 
-    public ClientService(ClientRepository clientRepository) {
+    public ClientService(ClientRepository clientRepository, TransactionRepository transactionRepository) {
         this.clientRepository = clientRepository;
+        this.transactionRepository = transactionRepository;
     }
 
     public List<ClientResponse> getAllClients() {
@@ -71,6 +75,8 @@ public class ClientService {
 
         from.withdraw(request.amount());
         to.deposit(request.amount());
+
+        transactionRepository.save(Transaction.transfer(from, to, request.amount()));
     }
 
     @Transactional
@@ -93,6 +99,14 @@ public class ClientService {
         client.close();
     }
 
+    public List<TransactionResponse> getClientHistory(Long id) {
+        findClientById(id);
+
+        return transactionRepository.findHistoryForClient(id).stream()
+                .map(this::toTransactionResponse)
+                .collect(Collectors.toList());
+    }
+
     private Client findClientById(Long id) {
         return clientRepository.findByIdAndClosedFalse(id)
                 .orElseThrow(() -> new ClientNotFoundException(id));
@@ -104,6 +118,22 @@ public class ClientService {
                 client.getFirstName(),
                 client.getLastName(),
                 client.getBalance()
+        );
+    }
+
+    private TransactionResponse toTransactionResponse(Transaction transaction) {
+        Client from = transaction.getFrom();
+        Client to = transaction.getTo();
+
+        return new TransactionResponse(
+                transaction.getId(),
+                transaction.getType(),
+                from.getId(),
+                from.getFirstName() + " " + from.getLastName(),
+                to.getId(),
+                to.getFirstName() + " " + to.getLastName(),
+                transaction.getAmount(),
+                transaction.getCreatedAt()
         );
     }
 

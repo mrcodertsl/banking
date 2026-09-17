@@ -6,6 +6,7 @@ import com.roladio.banking.exceptions.ClientNotFoundException;
 import com.roladio.banking.exceptions.InsufficientFundsException;
 import com.roladio.banking.model.Client;
 import com.roladio.banking.repository.ClientRepository;
+import com.roladio.banking.repository.TransactionRepository;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigDecimal;
@@ -18,7 +19,8 @@ import static org.mockito.Mockito.*;
 public class ClientServiceTest {
 
     private final ClientRepository repository = mock(ClientRepository.class);
-    private final ClientService service = new ClientService(repository);
+    private final TransactionRepository transactionRepository = mock(TransactionRepository.class);
+    private final ClientService service = new ClientService(repository, transactionRepository);
 
     @Test
     void getAllClients_returnsAllClients() {

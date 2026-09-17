@@ -50,7 +50,8 @@ src/main/java/com/roladio/banking
 │   ├── ClientResponse.java      # response shape for GET endpoints and POST /clients
 │   ├── LastNameRequest.java     # PATCH .../lastName body (no constraints — see API Reference)
 │   ├── PhoneNumberRequest.java  # PATCH .../phoneNumber body
-│   └── TransferRequest.java     # POST /clients/transfer body
+│   ├── TransferRequest.java     # POST /clients/transfer body
+│   └── TransactionResponse.java # one history entry; no endpoint returns it yet
 ├── exceptions/
 │   ├── ClientNotFoundException.java     # unchecked; carries "Client not found: <id>" -> 404
 │   ├── InsufficientFundsException.java  # unchecked; carries "Insufficient funds" -> 409
@@ -62,9 +63,9 @@ src/main/java/com/roladio/banking
 │   └── TransactionType.java      # enum, currently just TRANSFER
 ├── repository/
 │   ├── ClientRepository.java     # JpaRepository + row-locking and closed-filtering lookups
-│   └── TransactionRepository.java # JpaRepository + a per-client history query (unused so far)
+│   └── TransactionRepository.java # JpaRepository + a per-client history query
 └── service/
-    └── ClientService.java        # business logic: lookups, updates, transfers, closing
+    └── ClientService.java        # business logic: lookups, updates, transfers, closing, history
 
 src/main/resources/
 ├── application.properties        # base config; datasource via DB_* env vars
@@ -157,9 +158,15 @@ The consequence is that a closed client becomes indistinguishable from a non-exi
 
 `spring.jpa.hibernate.ddl-auto=validate` (see [Configuration](#configuration)) means Hibernate only checks this table matches the `Client` entity at startup — it never creates or alters it. Flyway owns the schema entirely.
 
-### `Transaction` entity (`model/Transaction.java`) — mapped, not yet written
+### `Transaction` entity (`model/Transaction.java`)
 
-`V5` creates a table to record money movements, and `Transaction` maps to it. **Nothing writes to it yet**: there is no repository and `transfer` does not create a row, so the table stays empty and transfers still leave no audit trail.
+`V5` creates a table to record money movements, and `Transaction` maps to it. Every successful transfer now writes one row — `ClientService.transfer` ends with:
+
+```java
+transactionRepository.save(Transaction.transfer(from, to, request.amount()));
+```
+
+The save sits inside the same `@Transactional` method as the two balance changes, so the ledger entry and the money movement commit or roll back together: a failed transfer leaves no row behind, and no row can exist without the matching balance change.
 
 | Field | Java type | Column | Notes |
 |---|---|---|---|
@@ -195,7 +202,19 @@ Storing `type` as `EnumType.STRING` rather than `ORDINAL` is what makes the colu
 List<Transaction> findHistoryForClient(@Param("clientId") Long clientId);
 ```
 
-The two `join fetch` clauses are the point of writing this by hand: `from` and `to` are `FetchType.LAZY`, so rendering a list of transactions would otherwise fire two extra selects per row. Fetching both in the same statement collapses that to a single query. Nothing calls this method yet — there is no service method and no endpoint.
+The two `join fetch` clauses are the point of writing this by hand: `from` and `to` are `FetchType.LAZY`, so rendering a list of transactions would otherwise fire two extra selects per row. Fetching both in the same statement collapses that to a single query.
+
+`ClientService.getClientHistory(id)` calls it, first resolving the client through `findClientById` so an unknown or closed id raises `ClientNotFoundException` (`404`) rather than silently returning an empty list. Results map to `TransactionResponse`, which flattens each party into an id and a display name:
+
+```java
+public record TransactionResponse(
+        Long id, TransactionType type,
+        Long fromId, String fromName,
+        Long toId, String toName,
+        BigDecimal amount, Instant createdAt) {}
+```
+
+**No endpoint exposes this yet** — the service method exists, but `ClientController` has no history route, so the history is unreachable over HTTP.
 
 > ⚠️ **The query does not use the `V5` indexes.** Because the filter references the *fetched* aliases (`t.from.id`) rather than the transaction's own foreign-key columns, PostgreSQL applies the `OR` as a join filter after joining, and falls back to a full scan of `transaction`. Measured on 40,005 rows where only 5 belong to the client in question:
 >
@@ -206,7 +225,9 @@ The two `join fetch` clauses are the point of writing this by hand: `from` and `
 >
 > That is roughly 70× on a small table, and the gap widens with volume: the current plan costs a scan of the *whole* table, while the indexed plan costs only the matching rows. The two indexes `V5` created for exactly this lookup are currently never consulted. Restructuring so the predicate lands on the FK columns — for instance selecting the matching ids in a subquery and fetching the associations around it — restores the index scan while keeping the eager fetch.
 
-> ⚠️ **`createdAt` is `null` on a freshly persisted instance.** Because the column is `insertable = false`, Hibernate omits it from the `INSERT` and does not read it back, so the value exists in the database but not on the object in memory. Verified against a real database: after `persist` + `flush` the entity has its generated `id` but `createdAt == null`; only after `em.refresh(...)` does it populate. If a future endpoint returns a transaction straight after creating it, annotate the field with Hibernate's `@Generated(event = INSERT)` so the value is selected back automatically.
+> ⚠️ **`createdAt` is `null` on a freshly persisted instance.** Because the column is `insertable = false`, Hibernate omits it from the `INSERT` and does not read it back, so the value exists in the database but not on the object in memory. Verified against a real database: after `persist` + `flush` the entity has its generated `id` but `createdAt == null`; only after a refresh or reload does it populate.
+>
+> This is harmless today because nothing returns a transaction straight after creating it — `transfer` discards the saved instance, and `getClientHistory` re-reads from the database, where the timestamp is present. It becomes a bug the moment an endpoint echoes back the transaction it just wrote. Annotating the field with Hibernate's `@Generated(event = INSERT)` makes the value be selected back automatically.
 
 | Column | Type | Constraints |
 |---|---|---|
@@ -236,7 +257,7 @@ Flyway migrations live in `src/main/resources/db/migration` and run automaticall
 | V2 | `V2__insert_seed_clients.sql` | Seeds 4 sample rows into `client`. |
 | V3 | `V3__update_seed_clients.sql` | Overwrites the first/last name and phone number of the 4 seeded rows (ids 1–4) with different sample data (`John Doe`, `Jane Roe`, `Richard Miles`, `Mary Major`) — balances from `V2` are untouched. |
 | V4 | `V4__add_closed_to_client.sql` | Adds the `closed BOOLEAN NOT NULL DEFAULT FALSE` soft-delete flag; the default leaves every existing row open. |
-| V5 | `V5__create_transaction_table.sql` | Creates the `transaction` table with FKs to `client` and indexes on both sides. Mapped by the `Transaction` entity, but **nothing writes to it yet** (see [Data Model](#transaction-entity-modeltransactionjava--mapped-not-yet-written)). |
+| V5 | `V5__create_transaction_table.sql` | Creates the `transaction` table with FKs to `client` and indexes on both sides. Mapped by the `Transaction` entity; every transfer now writes a row (see [Data Model](#transaction-entity-modeltransactionjava)). |
 
 **`V2` inserts, then `V3` overwrites names/phone numbers on top — net result after both run:**
 
@@ -802,8 +823,10 @@ Two details make this work without extra setup:
 - **`ClientRequest` serves two endpoints with different semantics**: `balance` seeds the opening balance on `POST /clients`, but is required-and-ignored on `PUT /clients/{id}` (see [API Reference](#put-clientsid)). Splitting it into `CreateClientRequest` / `UpdateClientRequest` would make both contracts honest.
 - **`updateClient_updatesAllFields` is now misnamed**: it no longer asserts anything about balance, because the endpoint no longer changes it — the name promises more than the test checks.
 - **`createClient`'s test doesn't verify the saved entity**: it stubs `repository.save(any(Client.class))` and only checks the returned `ClientResponse`, so a bug that dropped a field before calling `save` (e.g. forgetting to copy `phoneNumber`) wouldn't be caught. `POST /clients` also has no controller-slice or integration coverage, so its `201` and `Location` header are untested (see [Testing](#testing)).
-- **Transfers still leave no audit trail**: the table, the `Transaction` entity and now a `TransactionRepository` with a history query all exist, but `transfer` never inserts a row and no endpoint exposes the history. Balances move with no record of why, so a disputed transfer cannot be reconstructed. Everything is in place except the write — one `transactionRepository.save(Transaction.transfer(from, to, amount))` inside `ClientService.transfer`, which already holds both locked `Client` instances.
-- **`findHistoryForClient` bypasses the `V5` indexes**: filtering on the fetch-joined aliases makes PostgreSQL scan the whole `transaction` table instead of using `idx_transaction_from_id`/`idx_transaction_to_id` — measured at ~70× slower on 40k rows, degrading further as volume grows (see [Data Model](#reading-history--transactionrepository)).
+- **Transaction history is unreachable over HTTP**: transfers are recorded and `ClientService.getClientHistory` can read them back, but `ClientController` exposes no route, so nothing outside the application can see a statement. The service method also has no test.
+- **`fromName`/`toName` render as `"Cher null"` when a client has no last name**: `TransactionResponse` builds the display name with `getFirstName() + " " + getLastName()`, and `last_name` is nullable with no `@NotBlank` on `ClientRequest.lastName` — so a client created without one is reachable through the public API and its name renders with a literal `null`. Verified end-to-end.
+- **`findHistoryForClient` bypasses the `V5` indexes**: filtering on the fetch-joined aliases makes PostgreSQL scan the whole `transaction` table instead of using `idx_transaction_from_id`/`idx_transaction_to_id` — measured at ~70× slower on 40k rows, degrading further as volume grows. Now that `getClientHistory` calls it, this is on a live path (see [Data Model](#reading-history--transactionrepository)).
+- **Transaction history is unbounded**: `findHistoryForClient` returns every row for a client with no paging or limit, so a long-lived account loads its entire ledger into memory in one list.
 - **Closing is irreversible and retains all personal data**: `close()` is one-way — no endpoint reopens an account — and the soft delete keeps the name and phone number in the `client` table indefinitely. For an API holding personal data that is a retention decision worth making deliberately, and it means `DELETE /clients/{id}` does *not* satisfy a request to erase someone's data.
 - **`DELETE /clients/{id}` is not idempotent**: repeating it returns `404` rather than `204`, because a closed client is indistinguishable from a missing one (see [API Reference](#delete-clientsid)).
 - **No authentication/authorization**: every endpoint is unauthenticated and unauthorized — anyone who can reach port 8080 can read all client data and move money between any two accounts.
