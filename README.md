@@ -166,7 +166,7 @@ The consequence is that a closed client becomes indistinguishable from a non-exi
 transactionRepository.save(Transaction.transfer(from, to, request.amount()));
 ```
 
-The save sits inside the same `@Transactional` method as the two balance changes, so the ledger entry and the money movement commit or roll back together: a failed transfer leaves no row behind, and no row can exist without the matching balance change.
+The save sits inside the same `@Transactional` method as the two balance changes, so the ledger entry and the money movement commit or roll back together: a failed transfer leaves no row behind, and no row *written by the application* can exist without the matching balance change. The 100 rows seeded by `V6` are the exception — they were inserted directly, with no balance changes at all (see [Seed transactions](#seed-transactions-v6)).
 
 | Field | Java type | Column | Notes |
 |---|---|---|---|
@@ -260,6 +260,7 @@ Flyway migrations live in `src/main/resources/db/migration` and run automaticall
 | V3 | `V3__update_seed_clients.sql` | Overwrites the first/last name and phone number of the 4 seeded rows (ids 1–4) with different sample data (`John Doe`, `Jane Roe`, `Richard Miles`, `Mary Major`) — balances from `V2` are untouched. |
 | V4 | `V4__add_closed_to_client.sql` | Adds the `closed BOOLEAN NOT NULL DEFAULT FALSE` soft-delete flag; the default leaves every existing row open. |
 | V5 | `V5__create_transaction_table.sql` | Creates the `transaction` table with FKs to `client` and indexes on both sides. Mapped by the `Transaction` entity; every transfer now writes a row (see [Data Model](#transaction-entity-modeltransactionjava)). |
+| V6 | `V6__insert_seed_transactions.sql` | Seeds 100 sample `TRANSFER` rows between clients 1, 2 and 3, backdated over the last ~181 days. Inserts into `transaction` only — **no balance is touched** (see [Seed transactions](#seed-transactions-v6)). |
 
 **`V2` inserts, then `V3` overwrites names/phone numbers on top — net result after both run:**
 
@@ -274,13 +275,39 @@ Flyway migrations live in `src/main/resources/db/migration` and run automaticall
 
 Beyond these 4 seeded rows, new clients can be added at runtime via `POST /clients` (see [API Reference](#api-reference)).
 
+### Seed transactions (`V6`)
+
+`V6` gives the history endpoint something to show on a fresh database: 100 transfers in one multi-row `INSERT`, cycling through the six directed pairs of clients 1–3.
+
+| | |
+|---|---|
+| Rows | 100, all `type = 'TRANSFER'` |
+| Parties | clients 1, 2, 3 only — client 1 appears in 68 rows, clients 2 and 3 in 66 each; **client 4 has no history** |
+| Amounts | `9.40` to `4888.04`, total volume `67,243.85` |
+| Time span | `now() - 180 days 20 hours` for the oldest row to `now() - 8 hours` for the newest |
+| `id` | not supplied, so `GENERATED ALWAYS` assigns 1–100 in file order; the first real transfer on a fresh database gets `id` 101 |
+
+Three properties of the script matter when relying on it:
+
+- **`created_at` is relative to when the migration ran.** `now()` is evaluated once, when Flyway executes `V6`, so every database gets a different set of absolute timestamps, and the history keeps ageing afterwards — on a database migrated months ago, the "last 180 days" are long gone. The file is still byte-for-byte stable, so Flyway's checksum never changes.
+- **Row order and time order agree.** Each row is strictly older than the next, so `id` and `created_at` sort the same way and the newest-first history is also highest-`id`-first.
+- **The ledger does not add up to the balances.** `V6` never updates `client`, so balances stay at the `V2` values while the history claims large net movements:
+
+| Client | Net movement in `V6` | Balance after `V6` | Opening balance the history would imply |
+|---|---|---|---|
+| 1 John Doe | −12,298.62 | 5000.00 | 17,298.62 |
+| 2 Jane Roe | +3,249.28 | 1200.00 | **−2,049.28** |
+| 3 Richard Miles | +9,049.34 | 300.00 | **−8,749.34** |
+
+Replaying the history against the seeded balances instead, 35 of the 100 transfers would be rejected by `Client.withdraw` — the second row already has Jane Roe send `4104.41` while holding `1392.40`. So the sample history is illustrative only: it is not something the application itself could have produced, and summing a client's history does not reproduce its balance.
+
 To reset the database from scratch locally:
 
 With Docker Compose, delete the data volume and start over:
 
 ```bash
 docker compose down -v && docker compose up -d
-./mvnw spring-boot:run   # Flyway runs V1 through V5 on startup
+./mvnw spring-boot:run   # Flyway runs V1 through V6 on startup
 ```
 
 Against a server you manage yourself:
@@ -390,7 +417,7 @@ Its environment matches the defaults in `application.properties` exactly, so wit
    ./mvnw spring-boot:run
    ```
    On Windows: `mvnw.cmd spring-boot:run`. Add `-Dspring-boot.run.profiles=dev` to see the SQL it runs.
-4. The API is available at `http://localhost:8080`. Flyway applies any pending migrations (V1 table creation, V2 seed data, V3 seed-data overwrite, V4 soft-delete column, V5 transaction table) automatically before the app finishes starting.
+4. The API is available at `http://localhost:8080`. Flyway applies any pending migrations (V1 table creation, V2 seed data, V3 seed-data overwrite, V4 soft-delete column, V5 transaction table, V6 seed transactions) automatically before the app finishes starting.
 
 **Building a runnable jar**
 
@@ -624,34 +651,36 @@ After closing, the client vanishes from `GET /clients`, `GET /clients/{id}` retu
 Returns every money movement the client took part in — as sender *or* recipient — newest first. Each transfer therefore appears in the history of both parties.
 
 ```bash
-curl http://localhost:8080/clients/2/transactions
+curl http://localhost:8080/clients/3/transactions
 ```
 
-**Response — `200 OK`** (after transfers `1 → 2` of `100` and then `2 → 3` of `25.50`):
+**Response — `200 OK`** on a fresh database, where the list is the `V6` seed data — 66 entries for client 3, of which the two newest are shown (the timestamps depend on when the migration ran):
 
 ```json
 [
   {
-    "id": 2, "type": "TRANSFER",
-    "fromId": 2, "fromName": "Jane Roe",
-    "toId": 3, "toName": "Richard Miles",
-    "amount": 25.50, "createdAt": "2026-09-17T12:59:20.636013Z"
+    "id": 100, "type": "TRANSFER",
+    "fromId": 3, "fromName": "Richard Miles",
+    "toId": 1, "toName": "John Doe",
+    "amount": 83.25, "createdAt": "2026-09-17T05:10:45.354415Z"
   },
   {
-    "id": 1, "type": "TRANSFER",
+    "id": 99, "type": "TRANSFER",
     "fromId": 1, "fromName": "John Doe",
-    "toId": 2, "toName": "Jane Roe",
-    "amount": 100.00, "createdAt": "2026-09-17T12:59:20.600420Z"
+    "toId": 3, "toName": "Richard Miles",
+    "amount": 979.12, "createdAt": "2026-09-15T06:40:45.354415Z"
   }
 ]
 ```
+
+On a fresh database clients 1, 2 and 3 return 68, 66 and 66 entries; client 4 returns `[]` until it takes part in a transfer.
 
 | Field | Notes |
 |---|---|
 | `type` | Always `TRANSFER` today — the only `TransactionType` constant. |
 | `fromName` / `toName` | `firstName + " " + lastName`, built in `ClientService`. A client without a last name renders as e.g. `"Cher null"` (see [Known Issues](#known-issues--limitations)). |
 | `amount` | Read back from the `NUMERIC(19,2)` column, so always two decimal places (`100.00`), whatever scale the transfer request used. |
-| `createdAt` | ISO-8601 UTC instant with microsecond precision, taken from the database's `now()` at the start of the transfer's transaction. |
+| `createdAt` | ISO-8601 UTC instant with microsecond precision, taken from the database's `now()` at the start of the transfer's transaction. `V6` rows are backdated relative to the migration's `now()` instead. |
 
 There is no sign or direction field: whether an entry is money in or out for *this* client is only derivable by comparing `fromId`/`toId` with the `{id}` in the path.
 
@@ -787,7 +816,7 @@ Current state: **25 tests, all passing** (15 unit, 4 controller-slice, 5 integra
 
 | Test class | Type | Coverage |
 |---|---|---|
-| `BankingApplicationTests` | Integration (`@SpringBootTest` + `@Testcontainers`) | `contextLoads()` — boots the full application context against a disposable PostgreSQL container. Because startup runs Flyway and then `ddl-auto=validate`, this single test transitively proves that **V1→V5 apply cleanly to an empty database** and that the resulting schema **matches the `Client` entity**. |
+| `BankingApplicationTests` | Integration (`@SpringBootTest` + `@Testcontainers`) | `contextLoads()` — boots the full application context against a disposable PostgreSQL container. Because startup runs Flyway and then `ddl-auto=validate`, this single test transitively proves that **V1→V6 apply cleanly to an empty database** and that the resulting schema **matches the `Client` entity**. |
 | `service.ClientServiceTest` | Unit (Mockito-mocked `ClientRepository`, no DB) | `getAllClients` (mapping, size); `getClientById` plus its `ClientNotFoundException` path; `updatePhoneNumber`; `updateLastName`; `updateClient`; `createClient` (returns the saved client's id and mapped fields); `transfer` — happy path, same-account and insufficient-funds cases, and `transfer_savesTransactionRecord`, which verifies a `Transaction` is passed to `transactionRepository.save(...)`; `closeClient` with a zero and a non-zero balance. Balance assertions use AssertJ's `isEqualByComparingTo` (scale-independent `BigDecimal` comparison) rather than `isEqualTo`. |
 | `service.ClientServiceIntegrationTest` | Integration (`@SpringBootTest` + `@Testcontainers`) | Drives the real `ClientService` against a real database: a transfer moves money and **both balances survive the commit**; a failed transfer (insufficient funds) **leaves both balances unchanged**, proving the rollback; closing a client (after draining its balance) **removes it from the listing and makes it read as not-found**; a transfer `1 → 2` **appears at the top of client 1's history** with the right ids, amount, a non-null `createdAt` and a resolved `fromName`, and shows up in client 2's history too; and `getClientHistory` for an unknown id throws `ClientNotFoundException`. |
 | `controller.ClientControllerTest` | Web slice (`@WebMvcTest(ClientController.class)` + `@MockitoBean` service) | Exercises the HTTP layer with MockMvc and no database: `404` + problem-document `status`/`detail` for an unknown id; `400` with `errors.amount` for a negative amount; `400` with `errors.{fromId,toId,amount}` for an empty body; `409` when the service reports insufficient funds. |
@@ -804,6 +833,8 @@ The negative- and zero-amount transfer tests were removed from `ClientServiceTes
 - **It reads balances before acting** rather than asserting absolute amounts. The tests share a database with each other, and the money-moving test commits, so hard-coding "5000.00" would make them order-dependent. Capturing `fromBefore`/`toBefore` and asserting a *delta* keeps them independent.
 
 They do depend on the Flyway seed data, though: ids 1, 2 and 4 must exist, and **client 4 must have a zero balance** for the insufficient-funds case (`V2` seeds it at `0.0`; `V3` renames it to Mary Major without touching the balance). Changing the seed migrations can break these tests — see [Database & Migrations](#database--migrations).
+
+`V6` changes nothing for the balance tests, because it never touches `client`. It does mean every test container now starts with 68/66/66 history rows for clients 1/2/3 — which the history test only survives because its own transfer is timestamped after the backdated seed rows (the newest is `now() - 8 hours`).
 
 **How the container is wired up** (`BankingApplicationTests`):
 
@@ -824,7 +855,7 @@ class BankingApplicationTests {
 **Remaining gaps**
 
 - **`GET /clients/{id}/transactions` has no controller-slice test.** The service method is covered by integration tests, but nothing asserts the HTTP mapping — the `200` array shape or the `404` problem document.
-- **The history tests are shallow in places.** `transfer_savesTransactionRecord` matches `any(Transaction.class)`, so it would pass if the wrong parties, amount or type were recorded; the integration test only asserts client 2's history is non-empty rather than that it contains the transfer; and there is no unit test for `getClientHistory` or for the `TransactionResponse` mapping (including the `null` last-name case). The integration test's `getFirst()` check is reliable despite the shared database only because the test's own transfer is the most recent one.
+- **The history tests are shallow in places.** `transfer_savesTransactionRecord` matches `any(Transaction.class)`, so it would pass if the wrong parties, amount or type were recorded; the integration test's two `isNotEmpty()` checks on the histories of clients 1 and 2 are now **always true before the transfer even happens**, because `V6` seeds both — so they no longer prove anything, and only the `getFirst()` assertions on client 1's history test the new row; and there is no unit test for `getClientHistory` or for the `TransactionResponse` mapping (including the `null` last-name case). The integration test's `getFirst()` check is reliable despite the shared database only because the test's own transfer is the most recent one.
 - **No test covers history for a closed client** — neither the `404` on its own history nor its transfers remaining visible to a counterparty.
 - **Lock *contention* is still unproven.** `ClientServiceIntegrationTest` now runs `findByIdForUpdate` against a real PostgreSQL, so the locking query is known to be valid and to acquire a row lock. What no test does is run **two concurrent transactions**, which is what would actually demonstrate that one transfer blocks the other and that the ascending-id ordering prevents a deadlock (see [Concurrency](#concurrency)). That needs a test driving two threads with a barrier between them.
 - Only the `transfer` paths are covered end-to-end. `POST /clients` (`201` + `Location` header), the two `PATCH` endpoints and `PUT /clients/{id}` have no controller-slice or integration coverage — including the required-but-ignored `balance` behavior on `PUT`, which is the project's most surprising contract and rests on documentation alone.
@@ -884,6 +915,8 @@ Two details make this work without extra setup:
 - **History entries carry no direction**: the response has no in/out indicator or signed amount, so a consumer has to compare `fromId` with the requested id to know whether money arrived or left.
 - **`fromName`/`toName` render as `"Cher null"` when a client has no last name**: `TransactionResponse` builds the display name with `getFirstName() + " " + getLastName()`, and `last_name` is nullable with no `@NotBlank` on `ClientRequest.lastName` — so a client created without one is reachable through the public API and its name renders with a literal `null`. Verified end-to-end through `GET /clients/{id}/transactions`.
 - **`findHistoryForClient` bypasses the `V5` indexes**: filtering on the fetch-joined aliases makes PostgreSQL scan the whole `transaction` table instead of using `idx_transaction_from_id`/`idx_transaction_to_id` — measured at ~70× slower on 40k rows, degrading further as volume grows. Now that `GET /clients/{id}/transactions` calls it, this is on a live, public path (see [Data Model](#reading-history--transactionrepository)).
+- **Seeded history contradicts seeded balances**: `V6` inserts 100 transfers without adjusting any balance, so a client's history does not sum to its balance, and replayed in order it would drive clients 2 and 3 negative — something the application forbids (see [Seed transactions](#seed-transactions-v6)). Anything that reconciles balances against the ledger will report every seeded client as wrong.
+- **Sample data ships in versioned migrations**: `V2`, `V3` and now `V6` are ordinary Flyway migrations, so any database this application is pointed at — including a production one — receives four fake clients and 100 fake transfers between them. Moving seed scripts to a separate location enabled only for local profiles (e.g. `spring.flyway.locations` per profile) would keep them out.
 - **Transaction history is unbounded**: `findHistoryForClient` returns every row for a client with no paging or limit, and `GET /clients/{id}/transactions` serializes the whole list, so a long-lived account loads and sends its entire ledger in one response. Combined with the unindexed query above and the lack of authentication, this is also the cheapest endpoint to make expensive.
 - **Closing is irreversible and retains all personal data**: `close()` is one-way — no endpoint reopens an account — and the soft delete keeps the name and phone number in the `client` table indefinitely. For an API holding personal data that is a retention decision worth making deliberately, and it means `DELETE /clients/{id}` does *not* satisfy a request to erase someone's data.
 - **`DELETE /clients/{id}` is not idempotent**: repeating it returns `404` rather than `204`, because a closed client is indistinguishable from a missing one (see [API Reference](#delete-clientsid)).
