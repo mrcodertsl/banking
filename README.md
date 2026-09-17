@@ -61,7 +61,8 @@ src/main/java/com/roladio/banking
 │   ├── Transaction.java          # JPA entity for `transaction` — mapped, nothing writes it yet
 │   └── TransactionType.java      # enum, currently just TRANSFER
 ├── repository/
-│   └── ClientRepository.java     # JpaRepository + row-locking and closed-filtering lookups
+│   ├── ClientRepository.java     # JpaRepository + row-locking and closed-filtering lookups
+│   └── TransactionRepository.java # JpaRepository + a per-client history query (unused so far)
 └── service/
     └── ClientService.java        # business logic: lookups, updates, transfers, closing
 
@@ -178,6 +179,32 @@ public static Transaction transfer(Client from, Client to, BigDecimal amount) {
 ```
 
 Storing `type` as `EnumType.STRING` rather than `ORDINAL` is what makes the column readable and stable — adding or reordering enum constants can't silently reinterpret existing rows.
+
+#### Reading history — `TransactionRepository`
+
+`TransactionRepository` adds one query returning every movement a client took part in, newest first:
+
+```java
+@Query("""
+        select t from Transaction t
+        join fetch t.from
+        join fetch t.to
+        where t.from.id = :clientId or t.to.id = :clientId
+        order by t.createdAt desc
+        """)
+List<Transaction> findHistoryForClient(@Param("clientId") Long clientId);
+```
+
+The two `join fetch` clauses are the point of writing this by hand: `from` and `to` are `FetchType.LAZY`, so rendering a list of transactions would otherwise fire two extra selects per row. Fetching both in the same statement collapses that to a single query. Nothing calls this method yet — there is no service method and no endpoint.
+
+> ⚠️ **The query does not use the `V5` indexes.** Because the filter references the *fetched* aliases (`t.from.id`) rather than the transaction's own foreign-key columns, PostgreSQL applies the `OR` as a join filter after joining, and falls back to a full scan of `transaction`. Measured on 40,005 rows where only 5 belong to the client in question:
+>
+> | Filter written as | Plan | Time |
+> |---|---|---|
+> | `t.from.id = ? or t.to.id = ?` (current) | Seq Scan, 40,000 rows discarded by join filter | 8.76 ms |
+> | `from_id = ? or to_id = ?` (FK columns) | BitmapOr over `idx_transaction_from_id` + `idx_transaction_to_id` | 0.12 ms |
+>
+> That is roughly 70× on a small table, and the gap widens with volume: the current plan costs a scan of the *whole* table, while the indexed plan costs only the matching rows. The two indexes `V5` created for exactly this lookup are currently never consulted. Restructuring so the predicate lands on the FK columns — for instance selecting the matching ids in a subquery and fetching the associations around it — restores the index scan while keeping the eager fetch.
 
 > ⚠️ **`createdAt` is `null` on a freshly persisted instance.** Because the column is `insertable = false`, Hibernate omits it from the `INSERT` and does not read it back, so the value exists in the database but not on the object in memory. Verified against a real database: after `persist` + `flush` the entity has its generated `id` but `createdAt == null`; only after `em.refresh(...)` does it populate. If a future endpoint returns a transaction straight after creating it, annotate the field with Hibernate's `@Generated(event = INSERT)` so the value is selected back automatically.
 
@@ -775,7 +802,8 @@ Two details make this work without extra setup:
 - **`ClientRequest` serves two endpoints with different semantics**: `balance` seeds the opening balance on `POST /clients`, but is required-and-ignored on `PUT /clients/{id}` (see [API Reference](#put-clientsid)). Splitting it into `CreateClientRequest` / `UpdateClientRequest` would make both contracts honest.
 - **`updateClient_updatesAllFields` is now misnamed**: it no longer asserts anything about balance, because the endpoint no longer changes it — the name promises more than the test checks.
 - **`createClient`'s test doesn't verify the saved entity**: it stubs `repository.save(any(Client.class))` and only checks the returned `ClientResponse`, so a bug that dropped a field before calling `save` (e.g. forgetting to copy `phoneNumber`) wouldn't be caught. `POST /clients` also has no controller-slice or integration coverage, so its `201` and `Location` header are untested (see [Testing](#testing)).
-- **Transfers still leave no audit trail**: the `transaction` table and its `Transaction` entity both exist, but there is no repository, no insert in `transfer`, and no endpoint to read history. Balances move with no record of why, so a disputed transfer cannot be reconstructed. Schema and mapping are in place; the write path is not (see [Data Model](#transaction-entity-modeltransactionjava--mapped-not-yet-written)).
+- **Transfers still leave no audit trail**: the table, the `Transaction` entity and now a `TransactionRepository` with a history query all exist, but `transfer` never inserts a row and no endpoint exposes the history. Balances move with no record of why, so a disputed transfer cannot be reconstructed. Everything is in place except the write — one `transactionRepository.save(Transaction.transfer(from, to, amount))` inside `ClientService.transfer`, which already holds both locked `Client` instances.
+- **`findHistoryForClient` bypasses the `V5` indexes**: filtering on the fetch-joined aliases makes PostgreSQL scan the whole `transaction` table instead of using `idx_transaction_from_id`/`idx_transaction_to_id` — measured at ~70× slower on 40k rows, degrading further as volume grows (see [Data Model](#reading-history--transactionrepository)).
 - **Closing is irreversible and retains all personal data**: `close()` is one-way — no endpoint reopens an account — and the soft delete keeps the name and phone number in the `client` table indefinitely. For an API holding personal data that is a retention decision worth making deliberately, and it means `DELETE /clients/{id}` does *not* satisfy a request to erase someone's data.
 - **`DELETE /clients/{id}` is not idempotent**: repeating it returns `404` rather than `204`, because a closed client is indistinguishable from a missing one (see [API Reference](#delete-clientsid)).
 - **No authentication/authorization**: every endpoint is unauthenticated and unauthorized — anyone who can reach port 8080 can read all client data and move money between any two accounts.
