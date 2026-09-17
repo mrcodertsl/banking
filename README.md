@@ -154,6 +154,28 @@ The consequence is that a closed client becomes indistinguishable from a non-exi
 
 `spring.jpa.hibernate.ddl-auto=validate` (see [Configuration](#configuration)) means Hibernate only checks this table matches the `Client` entity at startup — it never creates or alters it. Flyway owns the schema entirely.
 
+### `transaction` table — schema only, not yet used
+
+`V5` creates a table to record money movements. **No Java code reads or writes it yet**: there is no `Transaction` entity, no repository, and `transfer` does not insert a row. Transfers currently leave no audit trail, and this table stays empty.
+
+| Column | Type | Constraints |
+|---|---|---|
+| `id` | `BIGINT` | `GENERATED ALWAYS AS IDENTITY PRIMARY KEY` |
+| `type` | `VARCHAR(20)` | `NOT NULL` — no `CHECK`, so any string is accepted |
+| `from_id` | `BIGINT` | `NOT NULL`, FK → `client(id)` |
+| `to_id` | `BIGINT` | `NOT NULL`, FK → `client(id)` |
+| `amount` | `NUMERIC(19,2)` | `NOT NULL`, `CHECK (amount > 0)` — mirrors `@Positive` on `TransferRequest` |
+| `created_at` | `TIMESTAMPTZ` | `NOT NULL DEFAULT now()` — set by the database, not the application |
+
+Plus `idx_transaction_from_id` and `idx_transaction_to_id`, which is what a "statement for one client" query would need.
+
+Two things about the shape are worth knowing before building on it:
+
+- **The foreign keys are safe because clients are never physically deleted.** Closing a client is a soft delete (see [Closing a client](#closing-a-client)), so `from_id`/`to_id` can never be orphaned and history survives account closure. Switching to a hard delete later would break this table.
+- **Both `from_id` and `to_id` are `NOT NULL`, so only two-sided movements fit.** A `type` column implies more kinds are planned, but a one-sided event (deposit, withdrawal, fee) has no second party to name — those would need a nullable column or a sentinel row.
+
+An extra table with no matching entity does not upset `ddl-auto=validate`: Hibernate checks that each entity has a conforming table, not the reverse, so the application starts normally.
+
 ## Database & Migrations
 
 Flyway migrations live in `src/main/resources/db/migration` and run automatically on application startup, in order:
@@ -164,6 +186,7 @@ Flyway migrations live in `src/main/resources/db/migration` and run automaticall
 | V2 | `V2__insert_seed_clients.sql` | Seeds 4 sample rows into `client`. |
 | V3 | `V3__update_seed_clients.sql` | Overwrites the first/last name and phone number of the 4 seeded rows (ids 1–4) with different sample data (`John Doe`, `Jane Roe`, `Richard Miles`, `Mary Major`) — balances from `V2` are untouched. |
 | V4 | `V4__add_closed_to_client.sql` | Adds the `closed BOOLEAN NOT NULL DEFAULT FALSE` soft-delete flag; the default leaves every existing row open. |
+| V5 | `V5__create_transaction_table.sql` | Creates the `transaction` table with FKs to `client` and indexes on both sides. Schema only — **no application code writes to it yet** (see [Data Model](#transaction-table--schema-only-not-yet-used)). |
 
 **`V2` inserts, then `V3` overwrites names/phone numbers on top — net result after both run:**
 
@@ -184,7 +207,7 @@ With Docker Compose, delete the data volume and start over:
 
 ```bash
 docker compose down -v && docker compose up -d
-./mvnw spring-boot:run   # Flyway runs V1 through V4 on startup
+./mvnw spring-boot:run   # Flyway runs V1 through V5 on startup
 ```
 
 Against a server you manage yourself:
@@ -294,7 +317,7 @@ Its environment matches the defaults in `application.properties` exactly, so wit
    ./mvnw spring-boot:run
    ```
    On Windows: `mvnw.cmd spring-boot:run`. Add `-Dspring-boot.run.profiles=dev` to see the SQL it runs.
-4. The API is available at `http://localhost:8080`. Flyway applies any pending migrations (V1 table creation, V2 seed data, V3 seed-data overwrite, V4 soft-delete column) automatically before the app finishes starting.
+4. The API is available at `http://localhost:8080`. Flyway applies any pending migrations (V1 table creation, V2 seed data, V3 seed-data overwrite, V4 soft-delete column, V5 transaction table) automatically before the app finishes starting.
 
 **Building a runnable jar**
 
@@ -639,7 +662,7 @@ Current state: **22 tests, all passing** (14 unit, 4 controller-slice, 3 integra
 
 | Test class | Type | Coverage |
 |---|---|---|
-| `BankingApplicationTests` | Integration (`@SpringBootTest` + `@Testcontainers`) | `contextLoads()` — boots the full application context against a disposable PostgreSQL container. Because startup runs Flyway and then `ddl-auto=validate`, this single test transitively proves that **V1→V4 apply cleanly to an empty database** and that the resulting schema **matches the `Client` entity**. |
+| `BankingApplicationTests` | Integration (`@SpringBootTest` + `@Testcontainers`) | `contextLoads()` — boots the full application context against a disposable PostgreSQL container. Because startup runs Flyway and then `ddl-auto=validate`, this single test transitively proves that **V1→V5 apply cleanly to an empty database** and that the resulting schema **matches the `Client` entity**. |
 | `service.ClientServiceTest` | Unit (Mockito-mocked `ClientRepository`, no DB) | `getAllClients` (mapping, size); `getClientById` plus its `ClientNotFoundException` path; `updatePhoneNumber`; `updateLastName`; `updateClient`; `createClient` (returns the saved client's id and mapped fields); `transfer` — happy path plus same-account and insufficient-funds cases. Balance assertions use AssertJ's `isEqualByComparingTo` (scale-independent `BigDecimal` comparison) rather than `isEqualTo`. |
 | `service.ClientServiceIntegrationTest` | Integration (`@SpringBootTest` + `@Testcontainers`) | Drives the real `ClientService` against a real database: a transfer moves money and **both balances survive the commit**; a failed transfer (insufficient funds) **leaves both balances unchanged**, proving the rollback; and closing a client (after draining its balance) **removes it from the listing and makes it read as not-found**. |
 | `controller.ClientControllerTest` | Web slice (`@WebMvcTest(ClientController.class)` + `@MockitoBean` service) | Exercises the HTTP layer with MockMvc and no database: `404` + problem-document `status`/`detail` for an unknown id; `400` with `errors.amount` for a negative amount; `400` with `errors.{fromId,toId,amount}` for an empty body; `409` when the service reports insufficient funds. |
@@ -729,6 +752,7 @@ Two details make this work without extra setup:
 - **`ClientRequest` serves two endpoints with different semantics**: `balance` seeds the opening balance on `POST /clients`, but is required-and-ignored on `PUT /clients/{id}` (see [API Reference](#put-clientsid)). Splitting it into `CreateClientRequest` / `UpdateClientRequest` would make both contracts honest.
 - **`updateClient_updatesAllFields` is now misnamed**: it no longer asserts anything about balance, because the endpoint no longer changes it — the name promises more than the test checks.
 - **`createClient`'s test doesn't verify the saved entity**: it stubs `repository.save(any(Client.class))` and only checks the returned `ClientResponse`, so a bug that dropped a field before calling `save` (e.g. forgetting to copy `phoneNumber`) wouldn't be caught. `POST /clients` also has no controller-slice or integration coverage, so its `201` and `Location` header are untested (see [Testing](#testing)).
+- **Transfers leave no audit trail**: `V5` creates a `transaction` table, but nothing maps to it — no entity, no repository, no insert in `transfer`, and no endpoint to read history. Balances move with no record of why, so a disputed transfer cannot be reconstructed. The schema is in place; the wiring is not (see [Data Model](#transaction-table--schema-only-not-yet-used)).
 - **Closing is irreversible and retains all personal data**: `close()` is one-way — no endpoint reopens an account — and the soft delete keeps the name and phone number in the `client` table indefinitely. For an API holding personal data that is a retention decision worth making deliberately, and it means `DELETE /clients/{id}` does *not* satisfy a request to erase someone's data.
 - **`DELETE /clients/{id}` is not idempotent**: repeating it returns `404` rather than `204`, because a closed client is indistinguishable from a missing one (see [API Reference](#delete-clientsid)).
 - **No authentication/authorization**: every endpoint is unauthenticated and unauthorized — anyone who can reach port 8080 can read all client data and move money between any two accounts.
